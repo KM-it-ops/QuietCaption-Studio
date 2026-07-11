@@ -61,7 +61,14 @@ powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 
 The script produces `dist\QuietCaption-Studio-portable.zip`. If Inno Setup 6 is installed, it also produces a Windows installer. Code signing is intentionally not automated because it requires the publisher's private certificate and explicit release approval.
 
+The public repository also includes a free GitHub Actions release pipeline. It rebuilds on a clean Windows runner, runs the full test suite, compiles the installer, publishes SHA-256 checksums, and creates Sigstore-backed GitHub provenance attestations. Verify a downloaded artifact with:
+
+```powershell
+gh attestation verify QuietCaption-Studio-Setup-1.0.0.exe --repo KM-it-ops/QuietCaption-Studio
+```
+
+Provenance verifies that an artifact came from this repository's workflow. It is complementary to Authenticode and does not remove Windows SmartScreen prompts. The project is eligible to apply for free trusted Authenticode signing through SignPath Foundation; that service requires external project approval before its signing step can be enabled.
+
 ## Privacy boundary
 
 Normal processing contains no telemetry, accounts, analytics, online transcription, or online translation. The update/download utility is a separate explicit API and verifies model artifacts with SHA-256 before atomic installation.
-

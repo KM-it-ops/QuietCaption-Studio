@@ -1,0 +1,71 @@
+name: Windows release build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build and test
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force .tmp-test | Out-Null
+          $env:TEMP = (Resolve-Path .tmp-test)
+          $env:TMP = $env:TEMP
+          $env:QT_QPA_PLATFORM = "offscreen"
+          powershell -ExecutionPolicy Bypass -File packaging\build.ps1
+
+      - name: Generate checksums
+        shell: powershell
+        run: |
+          Get-FileHash dist\QuietCaption-Studio-Setup-1.0.0.exe -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  QuietCaption-Studio-Setup-1.0.0.exe" } |
+            Set-Content -Encoding ascii dist\SHA256SUMS.txt
+          Get-FileHash dist\QuietCaption-Studio-portable.zip -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  QuietCaption-Studio-portable.zip" } |
+            Add-Content -Encoding ascii dist\SHA256SUMS.txt
+
+      - name: Attest installer provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/QuietCaption-Studio-Setup-1.0.0.exe
+
+      - name: Attest portable build provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/QuietCaption-Studio-portable.zip
+
+      - name: Upload verified release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuietCaption-Studio-Windows
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/QuietCaption-Studio-Setup-1.0.0.exe
+            dist/QuietCaption-Studio-portable.zip
+            dist/SHA256SUMS.txt
+

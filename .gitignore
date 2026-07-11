@@ -1,5 +1,6 @@
 .venv/
 .tmp-test/
+.pytest-runs/
 build/
 dist/
 *.spec.bak
@@ -7,4 +8,3 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 .superpowers/
-
