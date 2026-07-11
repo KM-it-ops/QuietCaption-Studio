@@ -21,3 +21,19 @@ def test_build_bootstraps_wheel_before_editable_install():
     editable = 'pip install --no-build-isolation -e ".[dev]"'
     assert bootstrap in script
     assert script.index(bootstrap) < script.index(editable)
+
+
+def test_pyinstaller_uses_package_safe_entrypoint():
+    spec = Path("packaging/quietcaption.spec").read_text(encoding="utf-8")
+    launcher = Path("packaging/entrypoint.py")
+    assert launcher.is_file()
+    source = launcher.read_text(encoding="utf-8")
+    assert "from quietcaption.app import main" in source
+    assert '"entrypoint.py"' in spec
+    assert "src/quietcaption/app.py" not in spec
+
+
+def test_build_finds_per_user_inno_setup_installation():
+    script = Path("packaging/build.ps1").read_text(encoding="utf-8")
+    assert "$env:LOCALAPPDATA" in script
+    assert 'Programs\\Inno Setup 6\\ISCC.exe' in script

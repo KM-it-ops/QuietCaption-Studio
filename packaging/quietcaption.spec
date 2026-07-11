@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 datas = collect_data_files("quietcaption")
 
 a = Analysis(
-    ["../src/quietcaption/app.py"],
+    ["entrypoint.py"],
     pathex=["../src"],
     binaries=[],
     datas=datas + [("../README.md", "."), ("../LICENSE", "."), ("../THIRD_PARTY_NOTICES.md", ".")],
