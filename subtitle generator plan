@@ -1,0 +1,797 @@
+I'll give you the complete organized project. Create this folder structure and copy each file:
+
+```
+autosub/
+├── autosub/
+│   ├── __init__.py
+│   ├── core.py
+│   ├── cli.py
+│   ├── web.py
+│   ├── updater.py
+│   └── version.py
+├── docker/
+│   ├── Dockerfile
+│   ├── Dockerfile.cpu
+│   ├── docker-compose.yml
+│   └── entrypoint.sh
+├── installers/
+│   ├── autosub.nsi
+│   ├── build.py
+│   ├── build_installer.py
+│   ├── build_windows.bat
+│   ├── build_mac.sh
+│   └── build_linux.sh
+├── downloads/          (created automatically)
+├── output/             (created automatically)
+├── requirements.txt
+├── setup.py
+├── Makefile
+├── install.sh
+└── README.md
+```
+
+Here are all the files:
+
+## **`autosub/__init__.py`**
+```python
+"""AutoSub - Automatic Multi-Language Subtitle Generator"""
+__version__ = "1.0.0"
+```
+
+## **`autosub/version.py`**
+```python
+"""Version information"""
+__version__ = "1.0.0"
+__build__ = "20240115"
+__channel__ = "stable"
+
+def get_version():
+    return f"{__version__}-{__channel__}"
+```
+
+## **`autosub/core.py`**
+```python
+#!/usr/bin/env python3
+"""
+AutoSub Core - Main pipeline for subtitle generation
+"""
+
+import os
+import re
+import tempfile
+import subprocess
+from pathlib import Path
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from datetime import timedelta
+
+try:
+    from faster_whisper import WhisperModel
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+
+try:
+    from deep_translator import GoogleTranslator
+    TRANSLATION_AVAILABLE = True
+except ImportError:
+    TRANSLATION_AVAILABLE = False
+
+try:
+    import yt_dlp
+    YTDLP_AVAILABLE = True
+except ImportError:
+    YTDLP_AVAILABLE = False
+
+
+@dataclass
+class SubtitleEntry:
+    index: int
+    start: float
+    end: float
+    text: str
+    
+    def to_srt_format(self) -> str:
+        start_time = self._format_time(self.start)
+        end_time = self._format_time(self.end)
+        return f"{self.index}\n{start_time} --> {end_time}\n{self.text}\n"
+    
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        td = timedelta(seconds=seconds)
+        hours, remainder = divmod(td.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        milliseconds = int(td.microseconds / 1000)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+
+class VideoDownloader:
+    def __init__(self, output_dir: str = "downloads"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+    
+    def download(self, url: str) -> Optional[Path]:
+        if not YTDLP_AVAILABLE:
+            print("Install yt-dlp: pip install yt-dlp")
+            return None
+        
+        try:
+            ydl_opts = {
+                'format': 'best[height<=1080]/best',
+                'outtmpl': str(self.output_dir / '%(title)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                return Path(filename)
+        except Exception as e:
+            print(f"Download error: {e}")
+            return None
+
+
+class AudioExtractor:
+    def extract(self, video_path: Path, output_path: Optional[Path] = None) -> Optional[Path]:
+        if output_path is None:
+            output_path = video_path.with_suffix('.wav')
+        
+        cmd = [
+            'ffmpeg', '-y', '-i', str(video_path),
+            '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            str(output_path)
+        ]
+        
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            return output_path
+        except Exception as e:
+            print(f"FFmpeg error: {e}")
+            return None
+
+
+class TranscriptionEngine:
+    def __init__(self, model_size: str = "base", device: str = "auto"):
+        self.model_size = model_size
+        self.device = device
+        self.model = None
+        
+    def load_model(self):
+        if not WHISPER_AVAILABLE:
+            raise RuntimeError("Install faster-whisper: pip install faster-whisper")
+        
+        compute_type = "float16" if self.device == "cuda" else "int8"
+        self.model = WhisperModel(self.model_size, device=self.device, compute_type=compute_type)
+        print(f"Loaded Whisper model: {self.model_size}")
+    
+    def transcribe(self, audio_path: Path) -> List[SubtitleEntry]:
+        if self.model is None:
+            self.load_model()
+        
+        segments, info = self.model.transcribe(
+            str(audio_path),
+            beam_size=5,
+            best_of=5,
+            condition_on_previous_text=True,
+            vad_filter=True
+        )
+        
+        print(f"Detected language: {info.language}")
+        
+        entries = []
+        for i, segment in enumerate(segments, 1):
+            entry = SubtitleEntry(
+                index=i,
+                start=segment.start,
+                end=segment.end,
+                text=segment.text.strip()
+            )
+            entries.append(entry)
+        
+        return entries
+
+
+class TranslationEngine:
+    def translate_entries(self, entries: List[SubtitleEntry], target_lang: str, source_lang: str = "auto") -> List[SubtitleEntry]:
+        if not TRANSLATION_AVAILABLE:
+            print("Install deep-translator: pip install deep-translator")
+            return entries
+        
+        translated = []
+        for entry in entries:
+            try:
+                translator = GoogleTranslator(source=source_lang, target=target_lang)
+                translated_text = translator.translate(entry.text)
+                
+                new_entry = SubtitleEntry(
+                    index=entry.index,
+                    start=entry.start,
+                    end=entry.end,
+                    text=translated_text
+                )
+                translated.append(new_entry)
+            except Exception as e:
+                print(f"Translation error: {e}")
+                translated.append(entry)
+        
+        return translated
+
+
+class SubtitleWriter:
+    def write_srt(self, entries: List[SubtitleEntry], output_path: Path):
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for entry in entries:
+                f.write(entry.to_srt_format() + '\n')
+        print(f"Created: {output_path}")
+
+
+class SubtitleBurner:
+    def burn(self, video_path: Path, subtitle_path: Path, output_path: Path):
+        cmd = [
+            'ffmpeg', '-y', '-i', str(video_path),
+            '-vf', f"subtitles={subtitle_path}:force_style='FontSize=24'",
+            '-c:a', 'copy', str(output_path)
+        ]
+        
+        try:
+            subprocess.run(cmd, capture_output=True, check=True)
+            print(f"Created: {output_path}")
+            return output_path
+        except Exception as e:
+            print(f"Burn error: {e}")
+            return None
+
+
+class AutoSubPipeline:
+    def __init__(self, model_size: str = "base", output_dir: str = "output"):
+        self.downloader = VideoDownloader()
+        self.audio_extractor = AudioExtractor()
+        self.transcriber = TranscriptionEngine(model_size)
+        self.translator = TranslationEngine()
+        self.writer = SubtitleWriter()
+        self.burner = SubtitleBurner()
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
+        
+    def process(self, source: str, target_languages: List[str] = None, burn_subtitles: bool = False, keep_audio: bool = False):
+        target_languages = target_languages or ['en']
+        results = {}
+        
+        # Get video
+        if source.startswith(('http://', 'https://')):
+            print(f"Downloading: {source}")
+            video_path = self.downloader.download(source)
+        else:
+            video_path = Path(source)
+        
+        if not video_path or not video_path.exists():
+            raise RuntimeError("Failed to get video")
+        
+        print(f"Processing: {video_path.name}")
+        
+        # Extract audio
+        audio_path = self.audio_extractor.extract(video_path)
+        if not audio_path:
+            raise RuntimeError("Failed to extract audio")
+        
+        # Transcribe
+        print("Transcribing...")
+        source_entries = self.transcriber.transcribe(audio_path)
+        
+        # Generate subtitles
+        base_name = video_path.stem
+        
+        for lang in target_languages:
+            if lang == 'en':
+                entries = source_entries
+            else:
+                print(f"Translating to {lang}...")
+                entries = self.translator.translate_entries(source_entries, lang)
+            
+            srt_path = self.output_dir / f"{base_name}.{lang}.srt"
+            self.writer.write_srt(entries, srt_path)
+            results[f"srt_{lang}"] = srt_path
+        
+        # Burn subtitles
+        if burn_subtitles:
+            for lang in target_languages:
+                srt_path = results.get(f"srt_{lang}")
+                if srt_path:
+                    output_video = self.output_dir / f"{base_name}.{lang}.mp4"
+                    self.burner.burn(video_path, srt_path, output_video)
+                    results[f"video_{lang}"] = output_video
+        
+        # Cleanup
+        if not keep_audio and audio_path.exists():
+            audio_path.unlink()
+        
+        print(f"\nDone! Files in: {self.output_dir}")
+        return results
+```
+
+## **`autosub/cli.py`**
+```python
+#!/usr/bin/env python3
+"""Command line interface"""
+
+import argparse
+import sys
+from pathlib import Path
+
+from .core import AutoSubPipeline
+
+
+def main():
+    parser = argparse.ArgumentParser(description='AutoSub - Automatic Subtitle Generator')
+    parser.add_argument('source', help='Video file or URL')
+    parser.add_argument('--langs', nargs='+', default=['en'], help='Target languages')
+    parser.add_argument('--model', default='base', choices=['tiny', 'base', 'small', 'medium', 'large'])
+    parser.add_argument('--burn', action='store_true', help='Burn subtitles into video')
+    parser.add_argument('--output', default='output', help='Output directory')
+    
+    args = parser.parse_args()
+    
+    # Ensure English is included
+    langs = list(set(args.langs + ['en']))
+    
+    pipeline = AutoSubPipeline(model_size=args.model, output_dir=args.output)
+    
+    results = pipeline.process(
+        source=args.source,
+        target_languages=langs,
+        burn_subtitles=args.burn
+    )
+    
+    print("\nGenerated files:")
+    for key, path in results.items():
+        print(f"  {key}: {path}")
+
+
+if __name__ == '__main__':
+    main()
+```
+
+## **`autosub/web.py`**
+```python
+#!/usr/bin/env python3
+"""Web interface"""
+
+import os
+import tempfile
+from pathlib import Path
+from flask import Flask, request, jsonify, render_template_string
+
+from .core import AutoSubPipeline
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AutoSub</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #fff;
+            min-height: 100vh;
+            padding: 40px 20px;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 {
+            text-align: center;
+            font-size: 2.5em;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .subtitle { text-align: center; color: #8892b0; margin-bottom: 40px; }
+        .card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .input-group { margin-bottom: 20px; }
+        label { display: block; margin-bottom: 8px; color: #ccd6f6; }
+        input, select {
+            width: 100%;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(0,0,0,0.2);
+            color: #fff;
+        }
+        .languages {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 10px;
+        }
+        .lang-option {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        button {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            border: none;
+            border-radius: 8px;
+            color: #fff;
+            font-size: 18px;
+            cursor: pointer;
+        }
+        #progress { display: none; margin-top: 20px; }
+        .progress-bar {
+            height: 4px;
+            background: rgba(255,255,255,0.1);
+            border-radius: 2px;
+            margin-top: 10px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            width: 0%;
+            transition: width 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>AutoSub</h1>
+        <p class="subtitle">Automatic Multi-Language Subtitle Generator</p>
+        
+        <div class="card">
+            <form id="subForm" enctype="multipart/form-data">
+                <div class="input-group">
+                    <label>Video URL</label>
+                    <input type="text" name="url" placeholder="https://...">
+                </div>
+                
+                <div class="input-group">
+                    <label>Or Upload File</label>
+                    <input type="file" name="video" accept="video/*">
+                </div>
+                
+                <div class="input-group">
+                    <label>Languages (English always included)</label>
+                    <div class="languages">
+                        <label class="lang-option"><input type="checkbox" name="langs" value="en" checked disabled> English</label>
+                        <label class="lang-option"><input type="checkbox" name="langs" value="pt" checked> Portuguese</label>
+                        <label class="lang-option"><input type="checkbox" name="langs" value="es"> Spanish</label>
+                        <label class="lang-option"><input type="checkbox" name="langs" value="fr"> French</label>
+                        <label class="lang-option"><input type="checkbox" name="langs" value="de"> German</label>
+                        <label class="lang-option"><input type="checkbox" name="langs" value="ja"> Japanese</label>
+                    </div>
+                </div>
+                
+                <button type="submit">Generate Subtitles</button>
+            </form>
+            
+            <div id="progress">
+                <div>Processing...</div>
+                <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        document.getElementById('subForm').onsubmit = async (e) => {
+            e.preventDefault();
+            const form = e.target;
+            document.getElementById('progress').style.display = 'block';
+            
+            const formData = new FormData(form);
+            const langs = Array.from(form.querySelectorAll('input[name="langs"]:checked')).map(cb => cb.value);
+            formData.set('langs', langs.join(','));
+            
+            const res = await fetch('/process', { method: 'POST', body: formData });
+            const data = await res.json();
+            
+            if (data.success) {
+                alert('Done! Check output folder');
+            } else {
+                alert('Error: ' + data.error);
+            }
+            
+            document.getElementById('progress').style.display = 'none';
+        };
+    </script>
+</body>
+</html>
+"""
+
+
+def create_app():
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def index():
+        return render_template_string(HTML_TEMPLATE)
+    
+    @app.route('/process', methods=['POST'])
+    def process():
+        try:
+            url = request.form.get('url')
+            video_file = request.files.get('video')
+            langs = request.form.get('langs', 'en').split(',')
+            
+            with tempfile.TemporaryDirectory() as tmpdir:
+                if video_file:
+                    input_path = Path(tmpdir) / video_file.filename
+                    video_file.save(input_path)
+                elif url:
+                    input_path = url
+                else:
+                    return jsonify({'success': False, 'error': 'No input'})
+                
+                pipeline = AutoSubPipeline()
+                results = pipeline.process(
+                    source=str(input_path),
+                    target_languages=langs
+                )
+                
+                return jsonify({'success': True, 'files': {k: str(v) for k, v in results.items()}})
+                
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+    
+    return app
+
+
+if __name__ == '__main__':
+    app = create_app()
+    app.run(host='0.0.0.0', port=8080, debug=True)
+```
+
+## **`autosub/updater.py`**
+```python
+#!/usr/bin/env python3
+"""Auto-updater module"""
+
+import json
+import threading
+from urllib.request import urlopen, Request
+
+GITHUB_API = "https://api.github.com/repos/yourname/autosub/releases/latest"
+CURRENT_VERSION = "1.0.0"
+
+
+def check_updates_on_startup():
+    """Background update check"""
+    def check():
+        try:
+            req = Request(GITHUB_API, headers={"User-Agent": f"AutoSub/{CURRENT_VERSION}"})
+            with urlopen(req, timeout=5) as response:
+                release = json.loads(response.read().decode('utf-8'))
+            
+            latest = release['tag_name'].lstrip('v')
+            
+            # Simple version compare
+            if latest > CURRENT_VERSION:
+                print(f"\n🔄 Update available: v{latest} (you have v{CURRENT_VERSION})")
+                print(f"   Download: {release['html_url']}\n")
+        except:
+            pass
+    
+    thread = threading.Thread(target=check, daemon=True)
+    thread.start()
+```
+
+## **`requirements.txt`**
+```
+faster-whisper>=0.10.0
+deep-translator>=1.11.0
+yt-dlp>=2023.0.0
+flask>=2.3.0
+flask-cors>=4.0.0
+pyinstaller>=5.13.0
+```
+
+## **`setup.py`**
+```python
+from setuptools import setup, find_packages
+
+setup(
+    name="autosub",
+    version="1.0.0",
+    packages=find_packages(),
+    install_requires=[
+        "faster-whisper>=0.10.0",
+        "deep-translator>=1.11.0",
+        "yt-dlp>=2023.0.0",
+        "flask>=2.3.0",
+        "flask-cors>=4.0.0",
+    ],
+    entry_points={
+        'console_scripts': [
+            'autosub=autosub.cli:main',
+            'autosub-web=autosub.web:create_app',
+        ],
+    },
+    python_requires='>=3.8',
+)
+```
+
+## **`Makefile`**
+```makefile
+.PHONY: install web docker build clean
+
+install:
+	pip install -r requirements.txt
+
+web:
+	python -m autosub.web
+
+docker:
+	docker-compose -f docker/docker-compose.yml up --build
+
+build:
+	python installers/build.py
+
+clean:
+	rm -rf build dist __pycache__
+```
+
+## **`docker/Dockerfile`**
+```dockerfile
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    python3.10 python3-pip ffmpeg git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+COPY autosub/ ./autosub/
+
+RUN mkdir -p /app/downloads /app/output
+
+EXPOSE 8080
+
+CMD ["python3", "-m", "autosub.web"]
+```
+
+## **`docker/Dockerfile.cpu`**
+```dockerfile
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y ffmpeg git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY autosub/ ./autosub/
+
+EXPOSE 8080
+
+CMD ["python", "-m", "autosub.web"]
+```
+
+## **`docker/docker-compose.yml`**
+```yaml
+version: '3.8'
+
+services:
+  autosub-gpu:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../downloads:/app/downloads
+      - ../output:/app/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  autosub-cpu:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu
+    ports:
+      - "8080:8080"
+    volumes:
+      - ../downloads:/app/downloads
+      - ../output:/app/output
+```
+
+## **`installers/build.py`**
+```python
+#!/usr/bin/env python3
+"""Build standalone executables"""
+
+import shutil
+import subprocess
+from pathlib import Path
+
+
+def clean():
+    for d in ['build', 'dist', '__pycache__']:
+        if Path(d).exists():
+            shutil.rmtree(d)
+
+
+def build():
+    clean()
+    
+    # Build CLI
+    subprocess.run([
+        'pyinstaller',
+        '--name=autosub',
+        '--onefile',
+        '--console',
+        'autosub/cli.py'
+    ], check=True)
+    
+    # Build Web
+    subprocess.run([
+        'pyinstaller',
+        '--name=AutoSub-Web',
+        '--onefile',
+        'autosub/web.py'
+    ], check=True)
+    
+    print("✅ Built: dist/autosub, dist/AutoSub-Web")
+
+
+if __name__ == '__main__':
+    build()
+```
+
+## **`README.md`**
+```markdown
+# AutoSub
+
+Automatic multi-language subtitle generator for videos.
+
+## Quick Start
+
+```bash
+# Install
+pip install -r requirements.txt
+
+# Run web interface
+make web
+
+# Or CLI
+python -m autosub.cli video.mp4 --langs en pt es
+```
+
+## Docker
+
+```bash
+docker-compose up
+```
+
+Open http://localhost:8080
+```
+
+## How to Run
+
+1. **Create the folder structure** above
+2. **Install**: `pip install -r requirements.txt`
+3. **Run Web**: `python -m autosub.web`
+4. **Or CLI**: `python -m autosub.cli "video.mp4" --langs en pt`
+
+That's it! The web interface opens at http://localhost:8080

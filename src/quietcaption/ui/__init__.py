@@ -1,0 +1,2 @@
+"""Native Qt user interface."""
+

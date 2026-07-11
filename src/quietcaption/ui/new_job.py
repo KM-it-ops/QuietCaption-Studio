@@ -1,0 +1,46 @@
+from pathlib import Path
+
+from PySide6.QtCore import Signal
+from PySide6.QtWidgets import QFileDialog, QComboBox, QFormLayout, QHBoxLayout, QLabel, QListWidget, QPushButton, QVBoxLayout, QWidget
+
+from .drop_zone import DropZone
+
+
+MEDIA_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+
+
+class NewJobView(QWidget):
+    generateRequested = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent); self.files: list[Path] = []
+        layout = QVBoxLayout(self); layout.setContentsMargins(28, 24, 28, 24); layout.setSpacing(14)
+        heading = QLabel("Create subtitles"); heading.setStyleSheet("font-size: 26px; font-weight: 600")
+        self.drop_zone = DropZone(); self.drop_zone.setMinimumHeight(150)
+        self.file_list = QListWidget(); self.file_list.setMaximumHeight(92); self.file_list.hide()
+        form = QFormLayout(); form.setSpacing(12)
+        self.source_language = QComboBox(); self.source_language.addItems(["Detect automatically", "English", "Spanish", "French", "German", "Japanese", "Arabic"])
+        self.target_language = QComboBox(); self.target_language.addItems(["No translation", "Spanish", "French", "German"])
+        self.model = QComboBox(); self.model.addItems(["Small — balanced", "Medium — accurate", "Large v3 — highest accuracy"])
+        self.output_format = QComboBox(); self.output_format.addItems(["SRT + VTT", "SRT", "VTT", "SRT + VTT + TXT"])
+        form.addRow("Spoken language", self.source_language); form.addRow("Translate offline to", self.target_language)
+        form.addRow("Transcription model", self.model); form.addRow("Output formats", self.output_format)
+        actions = QHBoxLayout(); self.compute = QLabel("CPU mode · automatic fallback"); self.compute.setObjectName("muted")
+        self.generate = QPushButton("Generate subtitles"); self.generate.setObjectName("primary"); self.generate.setEnabled(False)
+        actions.addWidget(self.compute); actions.addStretch(); actions.addWidget(self.generate)
+        for widget in (heading, self.drop_zone, self.file_list): layout.addWidget(widget)
+        layout.addLayout(form); layout.addStretch(); layout.addLayout(actions)
+        self.drop_zone.filesDropped.connect(self.add_files); self.drop_zone.browse.clicked.connect(self.browse)
+        self.generate.clicked.connect(lambda: self.generateRequested.emit(self.files.copy()))
+
+    def browse(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Choose media", "", "Media files (*.mp4 *.mkv *.mov *.avi *.webm *.mp3 *.wav *.m4a *.flac *.ogg)")
+        self.add_files([Path(item) for item in paths])
+
+    def add_files(self, paths):
+        for path in paths:
+            path = Path(path)
+            if path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES and path not in self.files:
+                self.files.append(path); self.file_list.addItem(f"{path.name}  ·  Ready")
+        self.file_list.setVisible(bool(self.files)); self.generate.setEnabled(bool(self.files))
+

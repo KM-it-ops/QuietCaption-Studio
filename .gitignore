@@ -1,0 +1,10 @@
+.venv/
+.tmp-test/
+build/
+dist/
+*.spec.bak
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.superpowers/
+
