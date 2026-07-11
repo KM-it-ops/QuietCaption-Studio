@@ -9,9 +9,12 @@ from ..media import FFmpegService
 from ..pipeline import PipelineRequest, SubtitlePipeline
 from ..projects import ProjectStore
 from ..settings import AppSettings
+from ..settings import SettingsStore
 from ..transcription import FasterWhisperTranscriber
 from .editor import SubtitleEditor
 from .new_job import NewJobView
+from .models_view import ModelsView
+from .settings_view import SettingsView
 
 
 class WorkerSignals(QObject):
@@ -30,8 +33,8 @@ class PipelineWorker(QRunnable):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, demo: bool = False, output_directory: Path | None = None):
-        super().__init__(); self.demo = demo; self.output_directory = output_directory; self.thread_pool = QThreadPool.globalInstance()
+    def __init__(self, demo: bool = False, output_directory: Path | None = None, settings_store=None):
+        super().__init__(); self.demo = demo; self.output_directory = output_directory; self.thread_pool = QThreadPool.globalInstance(); self.settings_store = settings_store or SettingsStore()
         self.setWindowTitle("QuietCaption Studio"); self.resize(1100, 720); self.setMinimumSize(820, 560)
         root = QWidget(); shell = QHBoxLayout(root); shell.setContentsMargins(0, 0, 0, 0); shell.setSpacing(0)
         sidebar = QFrame(); sidebar.setObjectName("sidebar"); sidebar.setFixedWidth(190); side = QVBoxLayout(sidebar)
@@ -42,14 +45,16 @@ class MainWindow(QMainWindow):
         side.addWidget(brand); side.addWidget(self.navigation); side.addStretch(); side.addWidget(self.offline_badge)
         self.pages = QStackedWidget(); self.new_job = NewJobView(); self.pages.addWidget(self.new_job)
         self.queue_page = self._queue_page()
-        self.models_page = self._placeholder("Local models", "Install and update transcription or translation models here. Downloads always require confirmation.")
-        self.settings_page = self._placeholder("Settings", "Output, performance, accessibility, and privacy preferences.")
+        self.models_page = ModelsView()
+        self.settings_page = SettingsView(self.settings_store)
         for page in (self.queue_page, self.models_page, self.settings_page): self.pages.addWidget(page)
         shell.addWidget(sidebar); shell.addWidget(self.pages, 1); self.setCentralWidget(root)
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
         compute = choose_compute(detect_hardware()); self.new_job.compute.setText(f"{compute.label} · automatic fallback")
         self.compute = compute
         self.new_job.generateRequested.connect(self._start_jobs)
+        self.settings_page.modeChanged.connect(self.new_job.set_interface_mode)
+        self.new_job.set_interface_mode(self.settings_store.load().interface_mode)
         self.statusBar().showMessage("Ready — media and transcripts stay on this device")
 
     @staticmethod
@@ -71,8 +76,7 @@ class MainWindow(QMainWindow):
         if not files: return
         self.navigation.setCurrentRow(1); self.queue_progress.show(); self.queue_status.setText(f"Processing {files[0].name} locally…")
         self.new_job.generate.setEnabled(False)
-        target_names = {"Spanish": "es", "French": "fr", "German": "de"}
-        selected = self.new_job.target_language.currentText(); targets = [target_names[selected]] if selected in target_names else []
+        target = self.new_job.target_language.code(); targets = [] if target == "none" else [target]
         formats = {"SRT": ["srt"], "VTT": ["vtt"], "SRT + VTT": ["srt", "vtt"], "SRT + VTT + TXT": ["srt", "vtt", "txt"]}[self.new_job.output_format.currentText()]
         output = self.output_directory or files[0].parent / "QuietCaption Output"
         if self.demo:
@@ -80,7 +84,7 @@ class MainWindow(QMainWindow):
         else:
             model = {"Small — balanced": "small", "Medium — accurate": "medium", "Large v3 — highest accuracy": "large-v3"}[self.new_job.model.currentText()]
             pipeline = SubtitlePipeline(FFmpegService(), FasterWhisperTranscriber(model, self.compute), None)
-        request = PipelineRequest(files[0], output, targets, formats)
+        request = PipelineRequest(files[0], output, targets, formats, self.new_job.source_language.code())
         worker = PipelineWorker(pipeline, request); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed)
         self._worker = worker; self.thread_pool.start(worker)
 

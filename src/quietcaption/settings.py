@@ -10,6 +10,7 @@ from platformdirs import user_config_path, user_data_path
 
 @dataclass(frozen=True)
 class AppSettings:
+    interface_mode: str = "everyday"
     theme: str = "system"
     output_directory: str = str(Path.home() / "Videos" / "QuietCaption")
     model_directory: str = str(user_data_path("QuietCaption Studio") / "models")
@@ -17,6 +18,10 @@ class AppSettings:
     source_language: str = "auto"
     translation_language: str = "none"
     onboarding_complete: bool = False
+    update_checks: bool = True
+    reduced_motion: bool = False
+    cache_limit_gb: int = 20
+    cpu_threads: int = 0
 
 
 class SettingsStore:
@@ -34,4 +39,3 @@ class SettingsStore:
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(asdict(settings), indent=2), encoding="utf-8")
         os.replace(temporary, self.path)
-
