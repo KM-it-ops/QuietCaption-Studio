@@ -14,3 +14,10 @@ def test_release_files_exist():
     for path in ["README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "packaging/quietcaption.spec", "packaging/build.ps1", "packaging/installer.iss"]:
         assert Path(path).is_file(), path
 
+
+def test_build_bootstraps_wheel_before_editable_install():
+    script = Path("packaging/build.ps1").read_text(encoding="utf-8")
+    bootstrap = 'pip install --upgrade pip setuptools wheel'
+    editable = 'pip install --no-build-isolation -e ".[dev]"'
+    assert bootstrap in script
+    assert script.index(bootstrap) < script.index(editable)

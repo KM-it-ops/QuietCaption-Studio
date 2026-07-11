@@ -6,6 +6,7 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
     python -m venv .venv
 }
 
+& .\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
 & .\.venv\Scripts\python.exe -m pip install --no-build-isolation -e ".[dev]"
 & .\.venv\Scripts\python.exe -m pytest -q
 if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
