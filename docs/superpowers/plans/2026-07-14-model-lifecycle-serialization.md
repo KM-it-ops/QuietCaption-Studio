@@ -48,4 +48,3 @@
 - [ ] **Step 7: Run focused and full GREEN verification** with unique bases; record RED/GREEN output in the task report; run redirected compileall and `git diff --check`. Expected: all PASS/exit 0.
 
 - [ ] **Step 8: Commit after independent approval** with `git commit -m "fix: serialize model lifecycle mutations"`, including only the files and report for this slice plus the factual ledger update.
-

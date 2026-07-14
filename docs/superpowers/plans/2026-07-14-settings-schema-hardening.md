@@ -47,4 +47,3 @@
 - [ ] **Step 7: Run full verification and record evidence**. Use a fresh full-suite basetemp, redirected compileall, and `git diff --check`; write the exact RED/GREEN output to the task report.
 
 - [ ] **Step 8: Commit after independent approval** with `git commit -m "fix: harden settings schema validation"`, including only this slice's code/tests/report and the factual ledger update.
-

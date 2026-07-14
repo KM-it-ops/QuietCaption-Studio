@@ -119,4 +119,3 @@ After independent spec/code review reports no Critical or Important findings:
 git add src/quietcaption/model_service.py src/quietcaption/ui/main_window.py src/quietcaption/ui/new_job.py tests/test_model_service.py tests/test_product_ui.py tests/test_control_contract.py tests/test_ui.py .superpowers/sdd/task-queue-runtime-snapshot-report.md .superpowers/sdd/progress.md
 git commit -m "fix: snapshot queue runtime inputs"
 ```
-
