@@ -67,19 +67,20 @@ def main() -> int:
         ).transcribe(decoded, "en")
         if not segments:
             raise RuntimeError("Real transcription produced no subtitle segments")
-        source_text = " ".join(segment.text for segment in segments)
+        source_texts = [segment.text for segment in segments]
+        source_text = " ".join(source_texts)
         translated = NllbCTranslate2Translator(
             args.model_root / translation.id, compute.device
-        ).translate([source_text], "en", "spa_Latn")
-        if not translated or not translated[0].strip():
-            raise RuntimeError("Real translation produced no text")
+        ).translate(source_texts, "en", "spa_Latn")
+        if len(translated) != len(source_texts) or any(not text.strip() for text in translated):
+            raise RuntimeError("Real translation did not produce one result per subtitle segment")
 
     print(json.dumps({
         "compute": {"device": compute.device, "type": compute.compute_type},
         "detected_language": language,
         "segments": len(segments),
         "transcription": source_text,
-        "translation_spa_Latn": translated[0],
+        "translation_spa_Latn": translated,
         "network_during_inference": "blocked",
     }, indent=2, ensure_ascii=False))
     return 0
