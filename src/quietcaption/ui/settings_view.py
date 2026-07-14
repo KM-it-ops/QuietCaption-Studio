@@ -9,7 +9,8 @@ class SettingsView(QWidget):
     settingsSaved = Signal(object)
 
     def __init__(self, store, parent=None):
-        super().__init__(parent); self.setObjectName("settingsView"); self.store = store; self.settings = store.load()
+        super().__init__(parent); self.setObjectName("settingsView"); self.store = store
+        load_result = store.load_result(); self.settings = load_result.settings
         layout = QVBoxLayout(self); layout.setContentsMargins(28, 24, 28, 24)
         heading = QLabel("Settings"); heading.setStyleSheet("font-size: 26px; font-weight: 600")
         mode_row = QHBoxLayout(); self.everyday_button = QPushButton("Everyday"); self.technical_button = QPushButton("Technical")
@@ -37,7 +38,7 @@ class SettingsView(QWidget):
         self.tabs.addTab(self._form([("Diagnostic detail", self.log_level)]), "Diagnostics")
         actions = QHBoxLayout(); self.export_button = QPushButton("Export"); self.import_button = QPushButton("Import"); self.reset_section_button = QPushButton("Reset section"); self.save_button = QPushButton("Save settings"); self.save_button.setObjectName("primary"); self.revert_button = QPushButton("Revert")
         actions.addWidget(self.export_button); actions.addWidget(self.import_button); actions.addWidget(self.reset_section_button); actions.addStretch(); actions.addWidget(self.revert_button); actions.addWidget(self.save_button)
-        self.status = QLabel("Changes are stored locally."); self.status.setObjectName("muted")
+        self.status = QLabel(load_result.warning or "Changes are stored locally."); self.status.setObjectName("muted")
         layout.addWidget(heading); layout.addLayout(mode_row); layout.addWidget(self.settings_search); layout.addWidget(self.tabs); layout.addStretch(); layout.addWidget(self.status); layout.addLayout(actions)
         self.everyday_button.clicked.connect(lambda: self.set_mode("everyday")); self.technical_button.clicked.connect(lambda: self.set_mode("technical"))
         self.output_browse.clicked.connect(lambda: self._choose_directory(self.output_path, "Choose output folder"))
@@ -95,7 +96,7 @@ class SettingsView(QWidget):
             self.status.setText(f"Settings were not saved: {exc}")
 
     def reload(self):
-        self.settings = self.store.load(); self.output_path.setText(self.settings.output_directory); self.model_path.setText(self.settings.model_directory); self.theme.setCurrentText(self.settings.theme); self.update_checks.setChecked(self.settings.update_checks); self.reduced_motion.setChecked(self.settings.reduced_motion); self.cache_limit.setValue(self.settings.cache_limit_gb); self.compute_device.setCurrentText(self.settings.compute_device); self.gpu_fallback.setChecked(self.settings.gpu_fallback); self.queue_concurrency.setValue(self.settings.queue_concurrency); self.subtitle_size.setValue(self.settings.subtitle_font_size); self.line_length.setValue(self.settings.subtitle_line_length); self.log_level.setCurrentText(self.settings.log_level); self._sync_mode(); self.status.setText("Unsaved changes reverted.")
+        load_result = self.store.load_result(); self.settings = load_result.settings; self.output_path.setText(self.settings.output_directory); self.model_path.setText(self.settings.model_directory); self.theme.setCurrentText(self.settings.theme); self.update_checks.setChecked(self.settings.update_checks); self.reduced_motion.setChecked(self.settings.reduced_motion); self.cache_limit.setValue(self.settings.cache_limit_gb); self.compute_device.setCurrentText(self.settings.compute_device); self.gpu_fallback.setChecked(self.settings.gpu_fallback); self.queue_concurrency.setValue(self.settings.queue_concurrency); self.subtitle_size.setValue(self.settings.subtitle_font_size); self.line_length.setValue(self.settings.subtitle_line_length); self.log_level.setCurrentText(self.settings.log_level); self._sync_mode(); self.status.setText(load_result.warning or "Unsaved changes reverted.")
 
     def export_settings(self):
         destination, _ = QFileDialog.getSaveFileName(self, "Export settings", "quietcaption-settings.json", "JSON files (*.json)")

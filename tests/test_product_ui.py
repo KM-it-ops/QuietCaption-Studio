@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -15,6 +17,46 @@ from quietcaption.pipeline import PipelineResult
 from quietcaption.settings import AppSettings, SettingsStore
 from quietcaption.ui.main_window import CancellationToken, MainWindow, PipelineWorker
 from quietcaption.ui.models_view import ModelsView
+from quietcaption.ui.settings_view import SettingsView
+
+
+def test_settings_view_surfaces_malformed_settings_warning_on_construction_and_reload(qtbot, tmp_path):
+    path = tmp_path / "settings.json"
+    original = b'{"theme":'
+    path.write_bytes(original)
+    view = SettingsView(SettingsStore(path)); qtbot.addWidget(view)
+
+    assert str(path) in view.status.text()
+    assert "parse" in view.status.text().lower()
+    assert path.read_bytes() == original
+
+    changed = json.dumps({"queue_concurrency": "2"}).encode()
+    path.write_bytes(changed)
+    view.reload()
+
+    assert str(path) in view.status.text()
+    assert "queue_concurrency" in view.status.text()
+    assert path.read_bytes() == changed
+
+
+def test_settings_view_missing_file_does_not_show_recovery_warning(qtbot, tmp_path):
+    path = tmp_path / "missing.json"
+    view = SettingsView(SettingsStore(path)); qtbot.addWidget(view)
+
+    assert view.status.text() == "Changes are stored locally."
+    assert not path.exists()
+
+
+def test_settings_view_keeps_normal_save_validation_status(qtbot, tmp_path):
+    path = tmp_path / "settings.json"
+    view = SettingsView(SettingsStore(path)); qtbot.addWidget(view)
+    view.settings = replace(view.settings, source_language=7)
+
+    qtbot.mouseClick(view.save_button, Qt.LeftButton)
+
+    assert "Settings were not saved" in view.status.text()
+    assert "source_language" in view.status.text()
+    assert not path.exists()
 
 
 def test_language_selectors_are_capability_driven(qtbot):

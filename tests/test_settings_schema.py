@@ -1,8 +1,149 @@
 import json
+from dataclasses import replace
 
 import pytest
+import quietcaption.settings as settings_module
 
-from quietcaption.settings import AppSettings, SettingsStore, SettingsValidationError
+from quietcaption.settings import (
+    AppSettings,
+    SettingsStore,
+    SettingsValidationError,
+)
+
+
+WRONG_TYPE_VALUES = (
+    ("schema_version", "3"),
+    ("interface_mode", 7),
+    ("theme", 7),
+    ("output_directory", 7),
+    ("model_directory", 7),
+    ("transcription_model", 7),
+    ("source_language", 7),
+    ("translation_language", 7),
+    ("onboarding_complete", 1),
+    ("update_checks", "yes"),
+    ("reduced_motion", 0),
+    ("cache_limit_gb", True),
+    ("cpu_threads", False),
+    ("compute_device", 7),
+    ("gpu_fallback", 1),
+    ("queue_concurrency", "2"),
+    ("queue_concurrency", True),
+    ("subtitle_font_size", True),
+    ("subtitle_line_length", False),
+    ("log_level", 7),
+)
+
+
+def test_settings_validation_field_sets_cover_every_dataclass_field():
+    covered = (
+        getattr(settings_module, "_BOOLEAN_FIELDS", set())
+        | getattr(settings_module, "_FREE_STRING_FIELDS", set())
+        | set(getattr(settings_module, "_INTEGER_RANGES", {}))
+        | set(getattr(settings_module, "_STRING_CHOICES", {}))
+    )
+
+    assert covered == set(AppSettings.__dataclass_fields__)
+
+
+@pytest.mark.parametrize(("field", "value"), WRONG_TYPE_VALUES)
+def test_settings_save_rejects_wrong_field_types_without_replacing_destination(tmp_path, field, value):
+    path = tmp_path / "settings.json"
+    original = b'{"theme": "dark"}\n'
+    path.write_bytes(original)
+    store = SettingsStore(path)
+
+    with pytest.raises(SettingsValidationError, match=field):
+        store.save(replace(AppSettings(), **{field: value}))
+
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    tuple((field, value) for field, value in WRONG_TYPE_VALUES if field not in {"model_directory", "output_directory"}),
+)
+def test_settings_import_rejects_wrong_field_types_without_replacing_destination(tmp_path, field, value):
+    path = tmp_path / "settings.json"
+    original = b'{"theme": "light"}\n'
+    path.write_bytes(original)
+    source = tmp_path / "import.json"
+    source.write_text(json.dumps({field: value}), encoding="utf-8")
+    store = SettingsStore(path)
+
+    with pytest.raises(SettingsValidationError, match=field):
+        store.import_from(source)
+
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("payload", ["not json", "[]", "42", '"settings"'])
+def test_settings_import_normalizes_malformed_payload_failures_without_replacing_destination(tmp_path, payload):
+    path = tmp_path / "settings.json"
+    original = b'{"theme": "dark"}\n'
+    path.write_bytes(original)
+    source = tmp_path / "import.json"
+    source.write_text(payload, encoding="utf-8")
+
+    with pytest.raises(SettingsValidationError):
+        SettingsStore(path).import_from(source)
+
+    assert path.read_bytes() == original
+
+
+def test_settings_load_result_missing_file_is_clean_defaults(tmp_path):
+    result = SettingsStore(tmp_path / "missing.json").load_result()
+
+    assert result.settings == AppSettings()
+    assert result.warning is None
+
+
+def test_settings_load_result_malformed_json_warns_without_rewriting_source(tmp_path):
+    path = tmp_path / "settings.json"
+    original = b'{"theme":'
+    path.write_bytes(original)
+
+    result = SettingsStore(path).load_result()
+
+    assert result.settings == AppSettings()
+    assert result.warning is not None
+    assert str(path) in result.warning
+    assert "parse" in result.warning.lower()
+    assert path.read_bytes() == original
+
+
+def test_settings_load_result_malformed_field_warns_without_rewriting_source(tmp_path):
+    path = tmp_path / "settings.json"
+    original = json.dumps({"theme": 7}).encode()
+    path.write_bytes(original)
+
+    result = SettingsStore(path).load_result()
+
+    assert result.settings == AppSettings()
+    assert result.warning is not None
+    assert str(path) in result.warning
+    assert "theme" in result.warning
+    assert path.read_bytes() == original
+
+
+def test_settings_load_result_migrates_valid_legacy_values_without_warning(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"schema_version": 1, "theme": "dark", "cpu_threads": 4}), encoding="utf-8")
+
+    result = SettingsStore(path).load_result()
+
+    assert result.settings.schema_version == AppSettings().schema_version
+    assert result.settings.theme == "dark"
+    assert result.settings.cpu_threads == 4
+    assert result.warning is None
+
+
+def test_settings_load_compatibility_returns_load_result_settings(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    store = SettingsStore(path)
+
+    assert store.load() == store.load_result().settings
 
 
 def test_settings_migrate_legacy_payload_and_preserve_known_values(tmp_path):
