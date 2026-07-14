@@ -1,3 +1,5 @@
+import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -61,6 +63,44 @@ def test_save_as_refuses_to_replace_an_existing_project(tmp_path):
     assert destination.read_text(encoding="utf-8") == "keep me"
     assert session.project_path == tmp_path / "clip.qcp"
     assert session.dirty
+    assert ProjectStore(session.recovery_path).load().tracks[0].segments[0].text == "edited"
+
+
+def test_save_as_refuses_existing_selected_export_and_writes_recovery(tmp_path):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "collision edit")
+    destination = tmp_path / "renamed.qcp"
+    export = tmp_path / "renamed.en.srt"
+    export.write_text("keep export", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        session.save_as(destination)
+
+    assert not destination.exists()
+    assert export.read_text(encoding="utf-8") == "keep export"
+    assert ProjectStore(session.recovery_path).load().tracks[0].segments[0].text == "collision edit"
+
+
+def test_save_as_race_at_project_publication_never_overwrites_and_recovers(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "racing edit")
+    destination = tmp_path / "raced.qcp"
+    real_link = atomic_module.os.link
+
+    def create_racer(source, target):
+        target = Path(target)
+        if target == destination:
+            target.write_text("racer", encoding="utf-8")
+        return real_link(source, target)
+
+    monkeypatch.setattr(atomic_module.os, "link", create_racer)
+
+    with pytest.raises(FileExistsError):
+        session.save_as(destination)
+
+    assert destination.read_text(encoding="utf-8") == "racer"
+    assert session.project_path == tmp_path / "clip.qcp"
+    assert ProjectStore(session.recovery_path).load().tracks[0].segments[0].text == "racing edit"
 
 
 def test_failed_save_preserves_all_originals_and_writes_recovery(tmp_path, monkeypatch):
@@ -116,6 +156,101 @@ def test_recovery_can_be_loaded_dirty_or_discarded(tmp_path):
     assert discarded.track.segments[0].text == "old"
     assert not discarded.recovery_path.exists()
     assert not discarded.dirty
+
+
+def test_stale_or_equal_recovery_does_not_prompt_or_replace_newer_durable_project(tmp_path):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "stale recovery")
+    session.write_recovery()
+    durable = ProjectStore(session.project_path).load()
+    durable_track = replace(durable.tracks[0], segments=[replace(durable.tracks[0].segments[0], text="new durable")])
+    ProjectStore(session.project_path).save(replace(durable, tracks=[durable_track]))
+    timestamp = session.project_path.stat().st_mtime_ns
+    os.utime(session.recovery_path, ns=(timestamp, timestamp))
+    decisions = []
+
+    opened = EditorSession.open(session.project_path, 0, list(session.export_paths.values()), lambda _: decisions.append(True) or "recover")
+
+    assert decisions == []
+    assert opened.track.segments[0].text == "new durable"
+    assert not opened.dirty
+
+
+def test_fresh_recovery_prompts_and_can_be_recovered(tmp_path):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "fresh recovery")
+    session.write_recovery()
+    durable_time = session.project_path.stat().st_mtime_ns
+    os.utime(session.recovery_path, ns=(durable_time + 1_000_000_000, durable_time + 1_000_000_000))
+    decisions = []
+
+    opened = EditorSession.open(session.project_path, 0, list(session.export_paths.values()), lambda _: decisions.append(True) or "recover")
+
+    assert decisions == [True]
+    assert opened.track.segments[0].text == "fresh recovery"
+    assert opened.dirty
+
+
+def test_recovery_unlink_failure_is_a_committed_save_warning(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "committed edit")
+    session.write_recovery()
+    real_unlink = Path.unlink
+
+    def deny_recovery_unlink(path, *args, **kwargs):
+        if path == session.recovery_path:
+            raise PermissionError("Windows file lock")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_recovery_unlink)
+
+    session.save()
+
+    assert not session.dirty
+    assert ProjectStore(session.project_path).load().tracks[0].segments[0].text == "committed edit"
+    assert "Windows file lock" in session.last_warning
+    decisions = []
+    reopened = EditorSession.open(session.project_path, 0, list(session.export_paths.values()), lambda _: decisions.append(True) or "recover")
+    assert decisions == []
+    assert reopened.track.segments[0].text == "committed edit"
+
+
+def test_save_as_updates_path_after_commit_when_old_recovery_cannot_be_removed(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "committed save as")
+    session.write_recovery()
+    old_recovery = session.recovery_path
+    destination = tmp_path / "new-name.qcp"
+    real_unlink = Path.unlink
+
+    def deny_old_recovery_unlink(path, *args, **kwargs):
+        if path == old_recovery:
+            raise PermissionError("Windows file lock")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_old_recovery_unlink)
+
+    session.save_as(destination)
+
+    assert session.project_path == destination
+    assert not session.dirty
+    assert ProjectStore(destination).load().tracks[0].segments[0].text == "committed save as"
+    assert "Windows file lock" in session.last_warning
+
+
+def test_primary_save_error_survives_recovery_write_failure(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "unsaved")
+    primary = OSError("publish failed")
+    recovery = OSError("recovery failed")
+    monkeypatch.setattr(session_module, "publish_text_batch", lambda *args, **kwargs: (_ for _ in ()).throw(primary))
+    monkeypatch.setattr(session, "write_recovery", lambda: (_ for _ in ()).throw(recovery))
+
+    with pytest.raises(OSError, match="publish failed") as caught:
+        session.save()
+
+    assert caught.value is primary
+    assert caught.value.recovery_error is recovery
 
 
 def test_successful_save_removes_recovery(tmp_path):

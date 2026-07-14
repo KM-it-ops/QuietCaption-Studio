@@ -213,16 +213,26 @@ class MainWindow(QMainWindow):
         )
 
     def request_close(self) -> bool:
+        decisions = []
         for editor in self._editors:
             if not editor.is_dirty():
                 continue
             choice = self._close_choice(editor)
             if choice == QMessageBox.Cancel:
                 return False
+            decisions.append((editor, choice))
+        for editor, choice in decisions:
+            editor.stop_recovery_timer()
             if choice == QMessageBox.Save and not editor.save():
+                editor.resume_recovery_timer()
                 return False
             if choice == QMessageBox.Discard:
-                editor.session.discard_recovery()
+                try:
+                    editor.session.discard_recovery()
+                except OSError as exc:
+                    editor.resume_recovery_timer()
+                    QMessageBox.critical(self, "Could not discard recovery", str(exc))
+                    return False
         return True
 
     def closeEvent(self, event):

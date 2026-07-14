@@ -25,11 +25,19 @@ from ..formats import format_timestamp
 class SubtitleEditor(QWidget):
     dirtyChanged = Signal(bool)
 
-    def __init__(self, session: EditorSession, parent=None, save_path_chooser=None, error_handler=None):
+    def __init__(
+        self,
+        session: EditorSession,
+        parent=None,
+        save_path_chooser=None,
+        error_handler=None,
+        warning_handler=None,
+    ):
         super().__init__(parent)
         self.session = session
         self._save_path_chooser = save_path_chooser or self._choose_save_path
         self._error_handler = error_handler or self._show_error
+        self._warning_handler = warning_handler or self._show_warning
         self._last_dirty = session.dirty
 
         layout = QVBoxLayout(self)
@@ -113,11 +121,12 @@ class SubtitleEditor(QWidget):
         try:
             self.session.save()
         except Exception as exc:
-            self._error_handler("Save failed", f"Your edits are still available in recovery. {exc}")
+            self._report_save_failure("Save failed", exc)
             self._update_dirty_status()
             return False
         self._recovery_timer.stop()
         self._update_dirty_status()
+        self._report_committed_warning()
         return True
 
     def save_as(self) -> bool:
@@ -127,12 +136,32 @@ class SubtitleEditor(QWidget):
         try:
             self.session.save_as(Path(destination))
         except Exception as exc:
-            self._error_handler("Save As failed", f"Choose a new local filename and try again. {exc}")
+            self._report_save_failure("Save As failed", exc)
             self._update_dirty_status()
             return False
         self._recovery_timer.stop()
         self._update_dirty_status()
+        self._report_committed_warning()
         return True
+
+    def stop_recovery_timer(self) -> None:
+        self._recovery_timer.stop()
+
+    def resume_recovery_timer(self) -> None:
+        if self.session.dirty:
+            self._recovery_timer.start()
+
+    def _report_save_failure(self, title: str, exc: Exception) -> None:
+        recovery_error = getattr(exc, "recovery_error", None)
+        if recovery_error is None:
+            detail = f"Your edits were written to the local recovery snapshot. {exc}"
+        else:
+            detail = f"{exc}. Recovery could not be written: {recovery_error}. Keep this editor open."
+        self._error_handler(title, detail)
+
+    def _report_committed_warning(self) -> None:
+        if self.session.last_warning:
+            self._warning_handler("Save completed with warning", self.session.last_warning)
 
     def _autosave_recovery(self) -> None:
         if not self.session.dirty:
@@ -149,3 +178,5 @@ class SubtitleEditor(QWidget):
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
 
+    def _show_warning(self, title: str, message: str) -> None:
+        QMessageBox.warning(self, title, message)

@@ -51,6 +51,69 @@ def test_save_as_cancellation_changes_nothing(qtbot, tmp_path):
     assert editor.is_dirty()
 
 
+def test_format_controls_toggle_all_supported_outputs_and_save_them(qtbot, tmp_path):
+    session = session_at(tmp_path)
+    editor = SubtitleEditor(session)
+    qtbot.addWidget(editor)
+    editor.table.item(0, 2).setText("all formats")
+
+    for extension in ("srt", "vtt", "txt"):
+        check = editor.format_checks[extension]
+        check.setChecked(False)
+        assert extension not in session.selected_formats
+        check.setChecked(True)
+        assert extension in session.selected_formats
+        assert check.accessibleName()
+
+    editor.save_action.trigger()
+
+    for extension in ("srt", "vtt", "txt"):
+        assert "all formats" in (tmp_path / f"clip.en.{extension}").read_text(encoding="utf-8")
+
+
+def test_successful_save_as_action_uses_chosen_path_and_surfaces_warning_separately(qtbot, tmp_path):
+    session = session_at(tmp_path)
+    destination = tmp_path / "chosen.qcp"
+    warnings = []
+    editor = SubtitleEditor(
+        session,
+        save_path_chooser=lambda _: destination,
+        warning_handler=lambda title, message: warnings.append((title, message)),
+    )
+    qtbot.addWidget(editor)
+    editor.table.item(0, 2).setText("chosen edit")
+
+    editor.save_as_action.trigger()
+
+    assert session.project_path == destination
+    assert ProjectStore(destination).load().tracks[0].segments[0].text == "chosen edit"
+    assert not editor.is_dirty()
+    assert warnings == []
+
+
+def test_committed_save_with_recovery_cleanup_failure_surfaces_warning(qtbot, tmp_path, monkeypatch):
+    session = session_at(tmp_path)
+    editor_warnings = []
+    editor = SubtitleEditor(session, warning_handler=lambda title, message: editor_warnings.append((title, message)))
+    qtbot.addWidget(editor)
+    editor.table.item(0, 2).setText("committed")
+    session.write_recovery()
+    recovery_path = session.recovery_path
+    real_unlink = Path.unlink
+
+    def deny_recovery_unlink(path, *args, **kwargs):
+        if path == recovery_path:
+            raise PermissionError("Windows file lock")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_recovery_unlink)
+
+    assert editor.save()
+
+    assert not editor.is_dirty()
+    assert editor_warnings and "Save committed" in editor_warnings[0][1]
+
+
 def test_dirty_edit_is_debounced_to_a_recovery_snapshot(qtbot, tmp_path):
     session = session_at(tmp_path)
     editor = SubtitleEditor(session)
@@ -116,3 +179,77 @@ def test_dirty_close_save_only_closes_on_success_and_discard_removes_recovery(qt
     window._close_choice = lambda _: QMessageBox.Discard
     assert window.request_close()
     assert not session.recovery_path.exists()
+
+
+def test_multi_editor_cancel_is_two_phase_and_preserves_all_state(qtbot, tmp_path):
+    first_session = session_at(tmp_path / "first")
+    second_session = session_at(tmp_path / "second")
+    first = SubtitleEditor(first_session)
+    second = SubtitleEditor(second_session)
+    window = MainWindow(demo=True)
+    qtbot.addWidget(window)
+    first.table.item(0, 2).setText("first edit")
+    second.table.item(0, 2).setText("second edit")
+    first_session.write_recovery()
+    second_session.write_recovery()
+    window._editors = [first, second]
+    choices = iter((QMessageBox.Save, QMessageBox.Cancel))
+    window._close_choice = lambda _: next(choices)
+
+    assert not window.request_close()
+
+    assert first_session.dirty and second_session.dirty
+    assert first_session.recovery_path.exists() and second_session.recovery_path.exists()
+    assert first._recovery_timer.isActive() and second._recovery_timer.isActive()
+    window._close_choice = lambda _: QMessageBox.Discard
+    window.close()
+
+
+def test_close_event_accepts_clean_and_ignores_cancelled_dirty_close(qtbot, tmp_path):
+    class Event:
+        def __init__(self):
+            self.accepted = None
+
+        def accept(self):
+            self.accepted = True
+
+        def ignore(self):
+            self.accepted = False
+
+    window = MainWindow(demo=True)
+    qtbot.addWidget(window)
+    clean_event = Event()
+    window.closeEvent(clean_event)
+    assert clean_event.accepted is True
+
+    session = session_at(tmp_path)
+    editor = SubtitleEditor(session)
+    editor.table.item(0, 2).setText("dirty")
+    window._editors = [editor]
+    window._close_choice = lambda _: QMessageBox.Cancel
+    dirty_event = Event()
+    window.closeEvent(dirty_event)
+    assert dirty_event.accepted is False
+    assert editor.is_dirty()
+    window._close_choice = lambda _: QMessageBox.Discard
+    accepted_dirty_event = Event()
+    window.closeEvent(accepted_dirty_event)
+    assert accepted_dirty_event.accepted is True
+    assert not editor._recovery_timer.isActive()
+
+
+def test_save_error_reports_when_recovery_could_not_be_written(qtbot, tmp_path, monkeypatch):
+    session = session_at(tmp_path)
+    errors = []
+    editor = SubtitleEditor(session, error_handler=lambda title, message: errors.append((title, message)))
+    qtbot.addWidget(editor)
+    editor.table.item(0, 2).setText("dirty")
+    primary = OSError("publish failed")
+    primary.recovery_error = OSError("recovery failed")
+    monkeypatch.setattr(session, "save", lambda: (_ for _ in ()).throw(primary))
+
+    assert not editor.save()
+
+    assert "publish failed" in errors[0][1]
+    assert "Recovery could not be written" in errors[0][1]
+    assert "recovery failed" in errors[0][1]
