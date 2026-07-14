@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from quietcaption.downloads import verify_sha256
-from quietcaption.hardware import HardwareProfile, choose_compute
+from quietcaption.hardware import HardwareProfile, choose_compute, resolve_compute
 from quietcaption.hardware import ComputeConfig
 from quietcaption.media import FFmpegService, MediaError, PyAVMediaService, best_available_media_service
 from quietcaption.models import ModelDescriptor, ModelRegistry
@@ -18,6 +18,40 @@ from quietcaption.demo import DemoTranslator
 def test_compute_prefers_usable_cuda_and_falls_back_to_cpu():
     assert choose_compute(HardwareProfile(True, "RTX", 8, 32)).device == "cuda"
     assert choose_compute(HardwareProfile(False, None, 0, 16)).device == "cpu"
+
+
+@pytest.mark.parametrize(
+    ("preference", "fallback", "profile", "device", "compute_type", "used_fallback", "can_run"),
+    [
+        ("automatic", True, HardwareProfile(True, "RTX", 8, 32), "cuda", "float16", False, True),
+        ("automatic", True, HardwareProfile(False, None, 0, 16), "cpu", "int8", False, True),
+        ("cpu", False, HardwareProfile(True, "RTX", 8, 32), "cpu", "int8", False, True),
+        ("cuda", False, HardwareProfile(True, "RTX", 3, 32), "cuda", "int8_float16", False, True),
+        ("cuda", True, HardwareProfile(False, None, 0, 16), "cpu", "int8", True, True),
+        ("cuda", False, HardwareProfile(False, None, 0, 16), None, None, False, False),
+    ],
+)
+def test_compute_resolution_honors_preference_and_fallback(
+    preference, fallback, profile, device, compute_type, used_fallback, can_run
+):
+    resolution = resolve_compute(preference, fallback, profile)
+
+    assert resolution.can_run is can_run
+    assert resolution.used_fallback is used_fallback
+    assert (resolution.config.device if resolution.config else None) == device
+    assert (resolution.config.compute_type if resolution.config else None) == compute_type
+
+
+def test_compute_resolution_explains_blocked_cuda_request():
+    resolution = resolve_compute("cuda", False, HardwareProfile(False, None, 0, 16))
+
+    assert "CUDA unavailable" in resolution.label
+    assert "Enable GPU fallback or select CPU" in resolution.blocking_reason
+
+
+def test_compute_resolution_rejects_invalid_preference():
+    with pytest.raises(ValueError, match="automatic, cpu, or cuda"):
+        resolve_compute("gpu", True, HardwareProfile(False, None, 0, 16))
 
 
 def test_model_registry_filters_by_kind_and_language(tmp_path):

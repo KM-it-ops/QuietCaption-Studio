@@ -1,6 +1,8 @@
 from PySide6.QtCore import SIGNAL
 from PySide6.QtWidgets import QAbstractButton, QPushButton
 
+from quietcaption.hardware import HardwareProfile
+from quietcaption.settings import SettingsStore
 from quietcaption.ui.main_window import MainWindow
 
 
@@ -29,3 +31,19 @@ def test_beam_control_preserves_its_value_across_interface_modes(qtbot):
     window.new_job.set_interface_mode("technical")
 
     assert beam.value() == 11
+
+
+def test_compute_controls_update_the_resolved_new_job_label(qtbot, tmp_path):
+    window = MainWindow(
+        demo=True,
+        settings_store=SettingsStore(tmp_path / "settings.json"),
+        hardware_probe=lambda: HardwareProfile(False, None, 0, 16),
+    )
+    qtbot.addWidget(window)
+    view = window.settings_page
+
+    view.compute_device.setCurrentText("cuda")
+    view.gpu_fallback.setChecked(False)
+    view.save()
+
+    assert "CUDA unavailable" in window.new_job.compute.text()

@@ -6,7 +6,7 @@ from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QListWi
 
 from ..demo import DemoMedia, DemoTranscriber, DemoTranslator
 from ..editor_session import EditorSession
-from ..hardware import choose_compute, detect_hardware
+from ..hardware import detect_hardware, resolve_compute
 from ..media import best_available_media_service
 from ..languages import default_registry
 from ..model_service import ModelService
@@ -47,9 +47,10 @@ class CancellationToken:
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, demo: bool = False, output_directory: Path | None = None, settings_store=None, model_service=None):
+    def __init__(self, demo: bool = False, output_directory: Path | None = None, settings_store=None, model_service=None, hardware_probe=detect_hardware):
         super().__init__(); self.demo = demo; self.output_directory = output_directory; self.thread_pool = QThreadPool.globalInstance(); self.settings_store = settings_store or SettingsStore()
         self._editors = []
+        self.hardware_profile = hardware_probe()
         initial_settings = self.settings_store.load()
         if model_service is None:
             registry_data = default_registry()
@@ -69,8 +70,6 @@ class MainWindow(QMainWindow):
         for page in (self.queue_page, self.models_page, self.settings_page): self.pages.addWidget(page)
         shell.addWidget(sidebar); shell.addWidget(self.pages, 1); self.setCentralWidget(root)
         self.navigation.currentRowChanged.connect(self.pages.setCurrentIndex)
-        compute = choose_compute(detect_hardware()); self.new_job.compute.setText(f"{compute.label} · automatic fallback")
-        self.compute = compute
         self.new_job.generateRequested.connect(self._start_jobs)
         self.settings_page.modeChanged.connect(self.new_job.set_interface_mode)
         self.settings_page.settingsSaved.connect(self._apply_settings)
@@ -88,6 +87,13 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(stylesheet_for(settings.theme))
+        self.compute_resolution = resolve_compute(
+            settings.compute_device,
+            settings.gpu_fallback,
+            self.hardware_profile,
+        )
+        self.compute = self.compute_resolution.config
+        self.new_job.compute.setText(self.compute_resolution.label)
 
     def _model_activated(self, descriptor):
         self._sync_active_models()
@@ -121,7 +127,13 @@ class MainWindow(QMainWindow):
 
     def _start_jobs(self, files):
         if not files: return
+        if not self.compute_resolution.can_run:
+            reason = self.compute_resolution.blocking_reason
+            self.queue_status.setText(reason)
+            self.statusBar().showMessage(reason)
+            return
         self._pending_files = list(files); self._completed_jobs = 0; self._last_result = None
+        self._queue_compute = self.compute_resolution.config
         self._queue_target = self.new_job.target_language.code()
         self._queue_formats = {"SRT": ["srt"], "VTT": ["vtt"], "SRT + VTT": ["srt", "vtt"], "SRT + VTT + TXT": ["srt", "vtt", "txt"]}[self.new_job.output_format.currentText()]
         self._queue_source_language = self.new_job.source_language.code()
@@ -153,8 +165,12 @@ class MainWindow(QMainWindow):
                 translation_model = self.models_page.service.active("translation")
                 if translation_model is None:
                     self._failed("No translation model is active. Install and activate one from Models."); return
-                translator = NllbCTranslate2Translator(self.models_page.service.registry.root / translation_model.id, self.compute.device)
-            pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), self.compute, self._queue_transcription_options), translator)
+                translator = NllbCTranslate2Translator(
+                    self.models_page.service.registry.root / translation_model.id,
+                    self._queue_compute.device,
+                    self._queue_compute.compute_type,
+                )
+            pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), self._queue_compute, self._queue_transcription_options), translator)
         request = PipelineRequest(source, output, targets, self._queue_formats, self._queue_source_language)
         self._cancel_token = CancellationToken()
         worker = PipelineWorker(pipeline, request, self._cancel_token); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed); worker.signals.cancelled.connect(self._cancelled)

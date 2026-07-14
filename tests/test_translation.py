@@ -1,3 +1,6 @@
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 from quietcaption.translation import NllbCTranslate2Translator
@@ -56,3 +59,24 @@ def test_nllb_translation_checks_cancellation_between_local_chunks(tmp_path):
 
     with pytest.raises(InterruptedError, match="cancelled"):
         translator.translate(["one", "two"], "en", "es", cancel=cancel)
+
+
+def test_nllb_forwards_explicit_compute_type_to_ctranslate2(monkeypatch, tmp_path):
+    calls = []
+
+    class RecordingTranslator:
+        def __init__(self, model_path, **kwargs):
+            calls.append((model_path, kwargs))
+
+    class RecordingSentencePiece:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    (tmp_path / "sentencepiece.bpe.model").write_bytes(b"local model")
+    monkeypatch.setitem(sys.modules, "ctranslate2", SimpleNamespace(Translator=RecordingTranslator))
+    monkeypatch.setitem(sys.modules, "sentencepiece", SimpleNamespace(SentencePieceProcessor=RecordingSentencePiece))
+    translator = NllbCTranslate2Translator(tmp_path, device="cuda", compute_type="float16")
+
+    translator._load()
+
+    assert calls == [(str(tmp_path), {"device": "cuda", "compute_type": "float16"})]

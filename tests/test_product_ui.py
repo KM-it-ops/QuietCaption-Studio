@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from quietcaption.languages import default_registry
+from quietcaption.hardware import HardwareProfile
 from quietcaption.models import built_in_catalog
 from quietcaption.models import ModelRegistry
 from quietcaption.models import ModelDescriptor
@@ -149,6 +150,144 @@ def test_saved_theme_is_applied_immediately(qtbot, tmp_path):
 
     assert store.load().theme == "light"
     assert "#f4f7fb" in QApplication.instance().styleSheet()
+
+
+def test_gpu_fallback_control_is_visible_persisted_and_applied_immediately(qtbot, tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(AppSettings(compute_device="cuda", gpu_fallback=True))
+    cpu_profile = HardwareProfile(False, None, 0, 16)
+    window = MainWindow(demo=True, settings_store=store, hardware_probe=lambda: cpu_profile)
+    qtbot.addWidget(window)
+
+    checkbox = window.settings_page.gpu_fallback
+    assert checkbox.text() == "Use CPU when requested CUDA is unavailable"
+    assert checkbox.isChecked()
+    checkbox.setChecked(False)
+    qtbot.mouseClick(window.settings_page.save_button, Qt.LeftButton)
+
+    assert store.load().gpu_fallback is False
+    assert window.compute_resolution.can_run is False
+    assert "CUDA unavailable" in window.new_job.compute.text()
+
+
+def test_saved_cpu_preference_overrides_available_cuda_at_startup(qtbot, tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(AppSettings(compute_device="cpu"))
+    profile = HardwareProfile(True, "RTX", 8, 32)
+
+    window = MainWindow(demo=True, settings_store=store, hardware_probe=lambda: profile)
+    qtbot.addWidget(window)
+
+    assert window.compute.device == "cpu"
+    assert window.new_job.compute.text() == "CPU · selected"
+
+
+def _production_compute_window(qtbot, tmp_path, monkeypatch, settings, profile):
+    transcription_model = ModelDescriptor("whisper-small", "transcription", {"*"}, 500, "local", "0" * 64)
+    translation_model = ModelDescriptor("nllb", "translation", {"*"}, 500, "local", "1" * 64)
+
+    class Service:
+        def __init__(self):
+            self.registry = ModelRegistry(tmp_path / "models", [transcription_model, translation_model])
+
+        def active(self, kind):
+            return transcription_model if kind == "transcription" else translation_model
+
+    class RecordingThreadPool:
+        def __init__(self):
+            self.workers = []
+
+        def start(self, worker):
+            self.workers.append(worker)
+
+    received = {"transcription": [], "translation": []}
+
+    def recording_transcriber(model, compute, options):
+        received["transcription"].append(compute)
+        return object()
+
+    def recording_translator(model, device="cpu", compute_type=None):
+        received["translation"].append((device, compute_type))
+        return object()
+
+    monkeypatch.setattr("quietcaption.ui.main_window.FasterWhisperTranscriber", recording_transcriber)
+    monkeypatch.setattr("quietcaption.ui.main_window.NllbCTranslate2Translator", recording_translator)
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(settings)
+    window = MainWindow(
+        demo=False,
+        output_directory=tmp_path / "output",
+        settings_store=store,
+        model_service=Service(),
+        hardware_probe=lambda: profile,
+    )
+    qtbot.addWidget(window)
+    window.thread_pool = RecordingThreadPool()
+    window.new_job.target_language.setCurrentIndex(1)
+    return window, store, received
+
+
+def test_cpu_fallback_is_forwarded_to_both_local_adapters(qtbot, tmp_path, monkeypatch):
+    window, _, received = _production_compute_window(
+        qtbot,
+        tmp_path,
+        monkeypatch,
+        AppSettings(compute_device="cuda", gpu_fallback=True, onboarding_complete=True),
+        HardwareProfile(False, None, 0, 16),
+    )
+
+    assert "CPU" in window.new_job.compute.text()
+    assert "fallback" in window.new_job.compute.text()
+    window._start_jobs([tmp_path / "first.wav"])
+
+    assert [(item.device, item.compute_type) for item in received["transcription"]] == [("cpu", "int8")]
+    assert received["translation"] == [("cpu", "int8")]
+
+
+def test_unavailable_cuda_blocks_before_queue_mutation_or_worker_creation(qtbot, tmp_path, monkeypatch):
+    window, _, received = _production_compute_window(
+        qtbot,
+        tmp_path,
+        monkeypatch,
+        AppSettings(compute_device="cuda", gpu_fallback=False, onboarding_complete=True),
+        HardwareProfile(False, None, 0, 16),
+    )
+
+    assert "CUDA unavailable" in window.new_job.compute.text()
+    window._start_jobs([tmp_path / "first.wav"])
+
+    guidance = f"{window.queue_status.text()} {window.statusBar().currentMessage()}"
+    assert "Enable GPU fallback or select CPU" in guidance
+    assert window.thread_pool.workers == []
+    assert received == {"transcription": [], "translation": []}
+    assert not hasattr(window, "_pending_files")
+
+
+def test_cuda_save_applies_immediately_and_queue_snapshot_stays_stable(qtbot, tmp_path, monkeypatch):
+    window, _, received = _production_compute_window(
+        qtbot,
+        tmp_path,
+        monkeypatch,
+        AppSettings(compute_device="cpu", onboarding_complete=True),
+        HardwareProfile(True, "RTX", 8, 32),
+    )
+    window.settings_page.compute_device.setCurrentText("cuda")
+    qtbot.mouseClick(window.settings_page.save_button, Qt.LeftButton)
+
+    assert window.new_job.compute.text() == "RTX · selected"
+    window._start_jobs([tmp_path / "first.wav", tmp_path / "second.wav"])
+    queue_compute = window._queue_compute
+    window.settings_page.compute_device.setCurrentText("cpu")
+    qtbot.mouseClick(window.settings_page.save_button, Qt.LeftButton)
+    window._completed(object())
+
+    assert window.compute.device == "cpu"
+    assert window._queue_compute is queue_compute
+    assert [(item.device, item.compute_type) for item in received["transcription"]] == [
+        ("cuda", "float16"),
+        ("cuda", "float16"),
+    ]
+    assert received["translation"] == [("cuda", "float16"), ("cuda", "float16")]
 
 
 def test_model_service_uses_the_saved_model_directory(qtbot, tmp_path):

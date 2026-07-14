@@ -52,9 +52,10 @@ class CTranslate2Translator:
 class NllbCTranslate2Translator:
     """Offline NLLB inference using an installed CTranslate2 snapshot."""
 
-    def __init__(self, model_path: Path, device: str = "cpu", engine=None, tokenizer=None):
+    def __init__(self, model_path: Path, device: str = "cpu", compute_type: str | None = None, engine=None, tokenizer=None):
         self.model_path = Path(model_path)
         self.device = "cuda" if device == "cuda" else "cpu"
+        self.compute_type = compute_type or ("int8_float16" if self.device == "cuda" else "int8")
         self._engine = engine
         self._tokenizer = tokenizer
 
@@ -70,8 +71,7 @@ class NllbCTranslate2Translator:
         if not tokenizer_path.is_file():
             raise RuntimeError("The active translation model is missing sentencepiece.bpe.model; verify or repair it")
         self._tokenizer = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
-        compute_type = "int8_float16" if self.device == "cuda" else "int8"
-        self._engine = ctranslate2.Translator(str(self.model_path), device=self.device, compute_type=compute_type)
+        self._engine = ctranslate2.Translator(str(self.model_path), device=self.device, compute_type=self.compute_type)
 
     def translate(self, texts: list[str], source_language: str, target_language: str, cancel=None) -> list[str]:
         _check_cancel(cancel)

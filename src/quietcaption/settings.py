@@ -8,7 +8,7 @@ from pathlib import Path
 from platformdirs import user_config_path, user_data_path
 
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 class SettingsValidationError(ValueError):
@@ -31,6 +31,7 @@ class AppSettings:
     cache_limit_gb: int = 20
     cpu_threads: int = 0
     compute_device: str = "automatic"
+    gpu_fallback: bool = True
     queue_concurrency: int = 1
     subtitle_font_size: int = 24
     subtitle_line_length: int = 42
@@ -59,6 +60,8 @@ class SettingsStore:
 
     @staticmethod
     def validate(settings: AppSettings) -> None:
+        if not isinstance(settings.gpu_fallback, bool):
+            raise SettingsValidationError("gpu_fallback must be a boolean")
         choices = {
             "interface_mode": {"everyday", "technical"},
             "theme": {"system", "light", "dark"},
@@ -105,7 +108,7 @@ class SettingsStore:
             "general": {"interface_mode", "theme"},
             "output": {"output_directory"},
             "models": {"model_directory", "transcription_model", "cache_limit_gb"},
-            "processing": {"source_language", "translation_language", "cpu_threads", "compute_device", "queue_concurrency"},
+            "processing": {"source_language", "translation_language", "cpu_threads", "compute_device", "gpu_fallback", "queue_concurrency"},
             "subtitle": {"subtitle_font_size", "subtitle_line_length"},
             "privacy": {"update_checks", "reduced_motion"},
             "diagnostics": {"log_level"},

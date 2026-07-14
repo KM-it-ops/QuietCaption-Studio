@@ -10,3 +10,13 @@ User-data-protection phase: complete at `25f64d0`; ready for the visible-control
 
 Transcription beam runtime wiring: complete (strict RED/GREEN recorded, focused tests passed (32), full suite passed (156), task review approved with no Critical or Important findings on 2026-07-14). The New Job beam value is now snapshotted per queue and reaches Faster-Whisper without changing demo behavior.
 Final review: ready to merge. Minor follow-ups: strengthen backend tests with multiple non-default values plus the implicit default of 5; optionally reject non-integer `TranscriptionOptions.beam_size` values if this internal value becomes a public programmatic API.
+
+Compute-device and GPU-fallback runtime wiring: complete on 2026-07-14.
+
+- RED: `python -m pytest -q tests/test_runtime.py tests/test_settings_schema.py tests/test_translation.py tests/test_product_ui.py tests/test_control_contract.py --basetemp .pytest-runs/<unique> -p no:cacheprovider` stopped during collection with 1 expected error because `resolve_compute` did not exist.
+- Initial GREEN attempt: the same focused command reached 55 passed and 1 failed; the sole failure was a test case-sensitivity mismatch against the brief's exact actionable `Enable GPU fallback or select CPU` wording. The assertion was corrected without changing production behavior.
+- GREEN: the same focused command with a fresh unique base passed 56 tests in 5.18s.
+- Regression: `python -m pytest -q --basetemp .pytest-runs/<unique> -p no:cacheprovider` with a fresh unique base passed 173 tests in 10.29s.
+- Static verification: `python -m compileall -q src` passed with a unique workspace-local `PYTHONPYCACHEPREFIX`; `git diff --check` passed.
+- Task review: approved. Startup and Save apply one injected hardware profile; unavailable explicit CUDA blocks before queue mutation; runnable queues snapshot one immutable compute config; Faster-Whisper and NLLB receive identical device and compute-type values. Demo pipeline construction, concurrency, language defaults, cache, appearance, updates, logging, lifecycle, and downloads remain unchanged.
+- Concerns: none. Runtime backend failures after a successfully detected CUDA profile remain surfaced normally and are intentionally outside this preflight policy task.

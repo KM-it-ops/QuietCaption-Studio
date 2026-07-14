@@ -14,6 +14,24 @@ def test_settings_migrate_legacy_payload_and_preserve_known_values(tmp_path):
     assert settings.schema_version >= 2
     assert settings.theme == "dark"
     assert settings.cpu_threads == 4
+    assert settings.gpu_fallback is True
+
+
+def test_gpu_fallback_round_trips_as_a_boolean(tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(AppSettings(compute_device="cuda", gpu_fallback=False))
+
+    loaded = store.load()
+
+    assert loaded.compute_device == "cuda"
+    assert loaded.gpu_fallback is False
+
+
+def test_settings_reject_non_boolean_gpu_fallback(tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+
+    with pytest.raises(SettingsValidationError, match="gpu_fallback"):
+        store.save(AppSettings(gpu_fallback="yes"))
 
 
 def test_settings_reject_invalid_ranges_before_saving(tmp_path):
