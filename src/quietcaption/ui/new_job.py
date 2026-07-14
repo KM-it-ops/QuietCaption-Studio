@@ -15,7 +15,7 @@ MEDIA_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".mp3", ".wav", ".m4a
 class NewJobView(QWidget):
     generateRequested = Signal(object)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, use_catalog_defaults: bool = True):
         super().__init__(parent); self.files: list[Path] = []
         layout = QVBoxLayout(self); layout.setContentsMargins(28, 24, 28, 24); layout.setSpacing(14)
         heading = QLabel("Create subtitles"); heading.setStyleSheet("font-size: 26px; font-weight: 600")
@@ -23,10 +23,12 @@ class NewJobView(QWidget):
         self.file_list = QListWidget(); self.file_list.setMaximumHeight(92); self.file_list.hide()
         form = QFormLayout(); form.setSpacing(12)
         registry = default_registry(); catalog = built_in_catalog(registry)
-        whisper = next(item for item in catalog if item.kind == "transcription"); nllb = next(item for item in catalog if item.kind == "translation")
+        whisper = next(item for item in catalog if item.kind == "transcription") if use_catalog_defaults else None
+        nllb = next(item for item in catalog if item.kind == "translation") if use_catalog_defaults else None
         self.source_language = CapabilityLanguageCombo(registry, whisper, "Detect automatically", "auto")
         self.target_language = CapabilityLanguageCombo(registry, nllb, "No translation", "none")
-        self.model = QComboBox(); self.model.addItems(["Small — balanced", "Medium — accurate", "Large v3 — highest accuracy"])
+        self.model = QComboBox(); self.model.setAccessibleName("Active transcription model")
+        self.set_active_models(whisper, nllb)
         self.output_format = QComboBox(); self.output_format.addItems(["SRT + VTT", "SRT", "VTT", "SRT + VTT + TXT"])
         form.addRow("Spoken language", self.source_language); form.addRow("Translate offline to", self.target_language)
         form.addRow("Transcription model", self.model); form.addRow("Output formats", self.output_format)
@@ -38,6 +40,16 @@ class NewJobView(QWidget):
         layout.addLayout(form); layout.addWidget(self.advanced_panel); layout.addStretch(); layout.addLayout(actions)
         self.drop_zone.filesDropped.connect(self.add_files); self.drop_zone.browse.clicked.connect(self.browse)
         self.generate.clicked.connect(lambda: self.generateRequested.emit(self.files.copy()))
+
+    def set_active_models(self, transcription_model, translation_model):
+        self.source_language.set_model(transcription_model) if hasattr(self, "source_language") else None
+        self.target_language.set_model(translation_model) if hasattr(self, "target_language") else None
+        if hasattr(self, "model"):
+            self.model.clear()
+            if transcription_model is None:
+                self.model.addItem("No active model", None)
+            else:
+                self.model.addItem(transcription_model.id, transcription_model.id)
 
     def set_interface_mode(self, mode: str):
         self.advanced_panel.setVisible(mode == "technical")

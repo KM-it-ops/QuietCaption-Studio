@@ -1,11 +1,15 @@
 from pathlib import Path
+from dataclasses import replace
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QStackedWidget, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget
 
 from ..demo import DemoMedia, DemoTranscriber, DemoTranslator
 from ..hardware import choose_compute, detect_hardware
-from ..media import FFmpegService
+from ..media import best_available_media_service
+from ..languages import default_registry
+from ..model_service import ModelService
+from ..models import ModelRegistry, built_in_catalog
 from ..pipeline import PipelineRequest, SubtitlePipeline
 from ..projects import ProjectStore
 from ..settings import AppSettings
@@ -16,6 +20,7 @@ from .editor import SubtitleEditor
 from .new_job import NewJobView
 from .models_view import ModelsView
 from .settings_view import SettingsView
+from .theme import stylesheet_for
 
 
 class WorkerSignals(QObject):
@@ -24,18 +29,27 @@ class WorkerSignals(QObject):
 
 
 class PipelineWorker(QRunnable):
-    def __init__(self, pipeline, request):
-        super().__init__(); self.pipeline, self.request, self.signals = pipeline, request, WorkerSignals()
+    def __init__(self, pipeline, request, cancel_token):
+        super().__init__(); self.pipeline, self.request, self.cancel_token, self.signals = pipeline, request, cancel_token, WorkerSignals()
 
     @Slot()
     def run(self):
-        try: self.signals.completed.emit(self.pipeline.run(self.request))
+        try: self.signals.completed.emit(self.pipeline.run(self.request, cancel=self.cancel_token))
         except Exception as exc: self.signals.failed.emit(str(exc))
 
 
+class CancellationToken:
+    def __init__(self):
+        self.cancelled = False
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, demo: bool = False, output_directory: Path | None = None, settings_store=None):
+    def __init__(self, demo: bool = False, output_directory: Path | None = None, settings_store=None, model_service=None):
         super().__init__(); self.demo = demo; self.output_directory = output_directory; self.thread_pool = QThreadPool.globalInstance(); self.settings_store = settings_store or SettingsStore()
+        initial_settings = self.settings_store.load()
+        if model_service is None:
+            registry_data = default_registry()
+            model_service = ModelService(ModelRegistry(Path(initial_settings.model_directory), built_in_catalog(registry_data)))
         self.setWindowTitle("QuietCaption Studio"); self.resize(1100, 720); self.setMinimumSize(820, 560)
         root = QWidget(); shell = QHBoxLayout(root); shell.setContentsMargins(0, 0, 0, 0); shell.setSpacing(0)
         sidebar = QFrame(); sidebar.setObjectName("sidebar"); sidebar.setFixedWidth(190); side = QVBoxLayout(sidebar)
@@ -44,9 +58,9 @@ class MainWindow(QMainWindow):
         for label in ("New job", "Queue", "Models", "Settings"): self.navigation.addItem(QListWidgetItem(label))
         self.navigation.setCurrentRow(0); self.offline_badge = QLabel("● Offline processing"); self.offline_badge.setObjectName("badge")
         side.addWidget(brand); side.addWidget(self.navigation); side.addStretch(); side.addWidget(self.offline_badge)
-        self.pages = QStackedWidget(); self.new_job = NewJobView(); self.pages.addWidget(self.new_job)
+        self.pages = QStackedWidget(); self.new_job = NewJobView(use_catalog_defaults=demo); self.pages.addWidget(self.new_job)
         self.queue_page = self._queue_page()
-        self.models_page = ModelsView()
+        self.models_page = ModelsView(service=model_service)
         self.settings_page = SettingsView(self.settings_store)
         for page in (self.queue_page, self.models_page, self.settings_page): self.pages.addWidget(page)
         shell.addWidget(sidebar); shell.addWidget(self.pages, 1); self.setCentralWidget(root)
@@ -55,8 +69,35 @@ class MainWindow(QMainWindow):
         self.compute = compute
         self.new_job.generateRequested.connect(self._start_jobs)
         self.settings_page.modeChanged.connect(self.new_job.set_interface_mode)
-        self.new_job.set_interface_mode(self.settings_store.load().interface_mode)
+        self.settings_page.settingsSaved.connect(self._apply_settings)
+        self.models_page.modelActivated.connect(self._model_activated)
+        loaded_settings = initial_settings
+        self.new_job.set_interface_mode(loaded_settings.interface_mode)
+        self._apply_settings(loaded_settings)
+        if not self.demo:
+            self._sync_active_models()
+            if not self.settings_store.load().onboarding_complete:
+                self.navigation.setCurrentRow(2)
         self.statusBar().showMessage("Ready — media and transcripts stay on this device")
+
+    def _apply_settings(self, settings):
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(stylesheet_for(settings.theme))
+
+    def _model_activated(self, descriptor):
+        self._sync_active_models()
+        transcription = self.models_page.service.active("transcription")
+        translation = self.models_page.service.active("translation")
+        if transcription is not None and translation is not None:
+            settings = replace(self.settings_store.load(), onboarding_complete=True)
+            self.settings_store.save(settings)
+
+    def _sync_active_models(self):
+        self.new_job.set_active_models(
+            self.models_page.service.active("transcription"),
+            self.models_page.service.active("translation"),
+        )
 
     @staticmethod
     def _placeholder(title, text):
@@ -70,16 +111,29 @@ class MainWindow(QMainWindow):
         heading = QLabel("Queue"); heading.setStyleSheet("font-size: 26px; font-weight: 600")
         self.queue_status = QLabel("No jobs yet"); self.queue_status.setObjectName("muted")
         self.queue_progress = QProgressBar(); self.queue_progress.setRange(0, 0); self.queue_progress.hide()
-        layout.addWidget(heading); layout.addWidget(self.queue_status); layout.addWidget(self.queue_progress); layout.addStretch()
+        self.cancel_button = QPushButton("Cancel current job"); self.cancel_button.setEnabled(False); self.cancel_button.clicked.connect(self._cancel_current_job)
+        layout.addWidget(heading); layout.addWidget(self.queue_status); layout.addWidget(self.queue_progress); layout.addWidget(self.cancel_button); layout.addStretch()
         return page
 
     def _start_jobs(self, files):
         if not files: return
-        self.navigation.setCurrentRow(1); self.queue_progress.show(); self.queue_status.setText(f"Processing {files[0].name} locally…")
+        self._pending_files = list(files); self._completed_jobs = 0; self._last_result = None
+        self._queue_target = self.new_job.target_language.code()
+        self._queue_formats = {"SRT": ["srt"], "VTT": ["vtt"], "SRT + VTT": ["srt", "vtt"], "SRT + VTT + TXT": ["srt", "vtt", "txt"]}[self.new_job.output_format.currentText()]
+        self._queue_source_language = self.new_job.source_language.code()
+        self.navigation.setCurrentRow(1); self.queue_progress.show()
         self.new_job.generate.setEnabled(False)
-        target = self.new_job.target_language.code(); targets = [] if target == "none" else [target]
-        formats = {"SRT": ["srt"], "VTT": ["vtt"], "SRT + VTT": ["srt", "vtt"], "SRT + VTT + TXT": ["srt", "vtt", "txt"]}[self.new_job.output_format.currentText()]
-        output = self.output_directory or files[0].parent / "QuietCaption Output"
+        self.cancel_button.setEnabled(True)
+        self._run_next_job()
+
+    def _run_next_job(self):
+        if not self._pending_files:
+            self._finish_queue()
+            return
+        source = self._pending_files.pop(0)
+        self.queue_status.setText(f"Processing {source.name} locally…")
+        target = self._queue_target; targets = [] if target == "none" else [target]
+        output = self.output_directory or Path(self.settings_store.load().output_directory)
         if self.demo:
             pipeline = SubtitlePipeline(DemoMedia(), DemoTranscriber(), DemoTranslator())
         else:
@@ -93,15 +147,34 @@ class MainWindow(QMainWindow):
                 if translation_model is None:
                     self._failed("No translation model is active. Install and activate one from Models."); return
                 translator = NllbCTranslate2Translator(self.models_page.service.registry.root / translation_model.id, self.compute.device)
-            pipeline = SubtitlePipeline(FFmpegService(), FasterWhisperTranscriber(str(transcription_path), self.compute), translator)
-        request = PipelineRequest(files[0], output, targets, formats, self.new_job.source_language.code())
-        worker = PipelineWorker(pipeline, request); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed)
+            pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), self.compute), translator)
+        request = PipelineRequest(source, output, targets, self._queue_formats, self._queue_source_language)
+        self._cancel_token = CancellationToken()
+        worker = PipelineWorker(pipeline, request, self._cancel_token); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed)
         self._worker = worker; self.thread_pool.start(worker)
+
+    def _cancel_current_job(self):
+        if getattr(self, "_cancel_token", None) is not None:
+            self._cancel_token.cancelled = True
+            self._pending_files = []
+            self.queue_status.setText("Cancelling safely after the current processing step…")
+            self.cancel_button.setEnabled(False)
 
     @Slot(object)
     def _completed(self, result):
-        self.queue_progress.hide(); self.queue_status.setText(f"Completed · {len(result.exports)} subtitle files created")
-        self.new_job.generate.setEnabled(True)
+        self._completed_jobs += 1; self._last_result = result
+        if self._pending_files:
+            self._run_next_job()
+        else:
+            self._finish_queue()
+
+    def _finish_queue(self):
+        self.queue_progress.hide(); self.cancel_button.setEnabled(False); self.new_job.generate.setEnabled(True)
+        count = getattr(self, "_completed_jobs", 0)
+        self.queue_status.setText(f"{count} job{'s' if count != 1 else ''} completed")
+        result = getattr(self, "_last_result", None)
+        if result is None:
+            return
         project = ProjectStore(result.project_path).load()
         editor = SubtitleEditor(project.tracks[-1]); editor.setObjectName("editor")
         self.pages.addWidget(editor); self.pages.setCurrentWidget(editor)
@@ -109,6 +182,6 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _failed(self, message):
-        self.queue_progress.hide(); self.queue_status.setText("Job failed — no source files were modified")
+        self._pending_files = []; self.queue_progress.hide(); self.cancel_button.setEnabled(False); self.queue_status.setText("Job failed — source media was not modified")
         self.new_job.generate.setEnabled(True)
         QMessageBox.critical(self, "QuietCaption could not finish", message)

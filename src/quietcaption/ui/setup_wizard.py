@@ -1,4 +1,4 @@
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget
 
 from ..setup import FindingStatus, RecommendationEngine, SetupScanner
@@ -15,6 +15,7 @@ class SetupPanel(QWidget):
         layout = QVBoxLayout(self)
         heading = QLabel("Hardware findings"); heading.setStyleSheet("font-size: 18px; font-weight: 600")
         self.findings_list = QListWidget(); self.findings_list.setAccessibleName("Hardware findings")
+        self.findings_list.setWordWrap(True); self.findings_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.findings_list.setMinimumHeight(235); self.findings_list.setMaximumHeight(245)
         symbols = {FindingStatus.READY: "Ready", FindingStatus.ACTION: "Action", FindingStatus.BLOCKING: "Blocking"}
         for finding in self.scan.findings:
             self.findings_list.addItem(QListWidgetItem(f"{symbols[finding.status]} · {finding.summary}\n{finding.detail}"))
@@ -26,4 +27,3 @@ class SetupPanel(QWidget):
         self.custom_button.clicked.connect(lambda: self.customRequested.emit(self.scan))
         actions.addWidget(self.automated_button); actions.addWidget(self.custom_button); actions.addStretch()
         layout.addWidget(heading); layout.addWidget(self.findings_list); layout.addWidget(recommendation); layout.addLayout(actions)
-

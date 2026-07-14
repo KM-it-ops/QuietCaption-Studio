@@ -12,7 +12,7 @@ license = {text = "MIT"}
 dependencies = ["platformdirs>=4.2", "PySide6>=6.7", "pycountry>=24.6", "huggingface-hub>=0.30"]
 
 [project.optional-dependencies]
-inference = ["faster-whisper>=1.0", "ctranslate2>=4.4", "sentencepiece>=0.2"]
+inference = ["faster-whisper>=1.0", "ctranslate2>=4.4", "sentencepiece>=0.2", "av>=11"]
 dev = ["pytest>=8.2", "pytest-qt>=4.4", "pyinstaller>=6.7"]
 
 [project.scripts]

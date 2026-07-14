@@ -53,7 +53,7 @@ class SetupScanner:
             findings.append(HardwareFinding(FindingStatus.READY, "CPU processing is available", f"{hardware.ram_gb:g} GB system RAM", "Use a smaller model for faster results"))
         findings.append(HardwareFinding(FindingStatus.READY if hardware.ram_gb >= 8 else FindingStatus.BLOCKING, f"{hardware.ram_gb:g} GB system memory detected", "8 GB minimum; 16 GB or more recommended"))
         findings.append(HardwareFinding(FindingStatus.READY if disk >= 8 else FindingStatus.BLOCKING, f"{disk:g} GB free model storage", "Recommended setup needs approximately 6 GB"))
-        findings.append(HardwareFinding(FindingStatus.READY if ffmpeg else FindingStatus.ACTION, "FFmpeg is ready" if ffmpeg else "FFmpeg setup is recommended", "Required to decode media", "Install or choose a local FFmpeg build" if not ffmpeg else ""))
+        findings.append(HardwareFinding(FindingStatus.READY if ffmpeg else FindingStatus.ACTION, "FFmpeg is ready" if ffmpeg else "Optional FFmpeg tools were not found", "The bundled local decoder handles transcription; external FFmpeg enables advanced burn-in workflows", "Install or choose a local FFmpeg build only if you need burn-in export" if not ffmpeg else ""))
         return SystemScan(hardware, disk, ffmpeg, tuple(findings))
 
 
@@ -68,4 +68,3 @@ class RecommendationEngine:
             reason = "A compact transcription model is recommended for reliable CPU and lower-memory operation."
             size = 3.4
         return SetupPlan(transcription, "nllb-200-distilled-600m", size, round(size * 1.15, 1), (reason, "NLLB-200 adds broad offline translation coverage."))
-

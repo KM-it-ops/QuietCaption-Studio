@@ -102,11 +102,12 @@ class SettingsStore:
 
     def reset_section(self, section: str) -> AppSettings:
         sections = {
-            "general": {"interface_mode", "theme", "update_checks", "reduced_motion"},
+            "general": {"interface_mode", "theme"},
             "output": {"output_directory"},
             "models": {"model_directory", "transcription_model", "cache_limit_gb"},
             "processing": {"source_language", "translation_language", "cpu_threads", "compute_device", "queue_concurrency"},
             "subtitle": {"subtitle_font_size", "subtitle_line_length"},
+            "privacy": {"update_checks", "reduced_motion"},
             "diagnostics": {"log_level"},
         }
         if section not in sections:

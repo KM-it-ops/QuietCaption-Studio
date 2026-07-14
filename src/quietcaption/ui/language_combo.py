@@ -7,11 +7,21 @@ class CapabilityLanguageCombo(QComboBox):
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.NoInsert)
         self.completer().setFilterMode(self.completer().filterMode())
-        self.addItem(leading_label, leading_code)
-        for language in registry.for_model(model):
-            self.addItem(f"{language.display_name}  [{language.code}]", language.code)
+        self.registry = registry
+        self.leading_label = leading_label
+        self.leading_code = leading_code
+        self.set_model(model)
         self.setAccessibleName(leading_label)
+
+    def set_model(self, model) -> None:
+        selected = self.code() if self.count() else self.leading_code
+        self.clear()
+        self.addItem(self.leading_label, self.leading_code)
+        if model is not None:
+            for language in self.registry.for_model(model):
+                self.addItem(f"{language.display_name}  [{language.code}]", language.code)
+        index = self.findData(selected)
+        self.setCurrentIndex(index if index >= 0 else 0)
 
     def code(self) -> str:
         return self.currentData() or ""
-

@@ -11,7 +11,7 @@ def test_package_has_desktop_entrypoint_and_no_online_translation_dependency():
 
 
 def test_release_files_exist():
-    for path in ["README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "packaging/quietcaption.spec", "packaging/build.ps1", "packaging/installer.iss"]:
+    for path in ["README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "packaging/quietcaption.spec", "packaging/build.ps1", "packaging/smoke.ps1", "packaging/installer.iss"]:
         assert Path(path).is_file(), path
 
 
@@ -58,3 +58,21 @@ def test_release_build_uses_unique_workspace_pytest_directory():
     assert "--basetemp" in script
     assert "-p no:cacheprovider" in script
     assert ".tmp-test" not in workflow
+
+
+def test_pyinstaller_collects_dynamically_loaded_inference_packages():
+    spec = Path("packaging/quietcaption.spec").read_text(encoding="utf-8")
+    for package in ("faster_whisper", "ctranslate2", "sentencepiece", "av"):
+        assert package in spec
+    for unused in ("transformers", "torch", "tensorflow"):
+        assert f'"{unused}"' in spec
+    assert "ctranslate2.converters" in spec
+
+
+def test_release_pipeline_smoke_tests_portable_and_installed_apps():
+    workflow = Path(".github/workflows/windows-release.yml").read_text(encoding="utf-8")
+    smoke = Path("packaging/smoke.ps1").read_text(encoding="utf-8")
+    assert "packaging\\smoke.ps1" in workflow
+    assert "QuietCaption-Studio-Setup-1.0.0.exe" in smoke
+    assert "--demo" in smoke
+    assert "/VERYSILENT" in smoke
