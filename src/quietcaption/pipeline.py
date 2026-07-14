@@ -40,12 +40,10 @@ class _NamespaceReservation:
     def __init__(self, output_directory: Path, base_name: str):
         normalized_name = os.path.normcase(base_name)
         digest = hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()
-        self.directory = output_directory / ".quietcaption-reservations"
-        self.path = self.directory / f"{digest}.lock"
+        self.path = output_directory / f".quietcaption-reservation-{digest}.lock"
         self.acquired = False
 
     def acquire(self) -> bool:
-        self.directory.mkdir(parents=True, exist_ok=True)
         try:
             descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
@@ -58,10 +56,6 @@ class _NamespaceReservation:
         if self.acquired:
             self.path.unlink(missing_ok=True)
             self.acquired = False
-        try:
-            self.directory.rmdir()
-        except (FileNotFoundError, OSError):
-            pass
 
 
 @dataclass(frozen=True)
@@ -114,8 +108,8 @@ class SubtitlePipeline:
 
             for path, content in rendered_exports:
                 temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-                temporary.write_text(content, encoding="utf-8")
                 staged_exports.append(temporary)
+                temporary.write_text(content, encoding="utf-8")
             ProjectStore(project_path).save(project)
             exports = []
             for temporary, (path, _) in zip(staged_exports, rendered_exports, strict=True):

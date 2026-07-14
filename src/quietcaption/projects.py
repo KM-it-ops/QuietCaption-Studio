@@ -15,6 +15,8 @@ class ProjectStore:
     def save(self, project: Project) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(json.dumps(project.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temporary, self.path)
-
+        try:
+            temporary.write_text(json.dumps(project.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, self.path)
+        finally:
+            temporary.unlink(missing_ok=True)

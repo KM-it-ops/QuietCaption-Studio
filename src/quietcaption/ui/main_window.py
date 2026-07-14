@@ -175,6 +175,10 @@ class MainWindow(QMainWindow):
         result = getattr(self, "_last_result", None)
         if result is None:
             return
+        if result.skipped:
+            self.queue_status.setText("Job skipped — existing output kept")
+            self.statusBar().showMessage("Skipped because output already exists")
+            return
         project = ProjectStore(result.project_path).load()
         editor = SubtitleEditor(project.tracks[-1]); editor.setObjectName("editor")
         self.pages.addWidget(editor); self.pages.setCurrentWidget(editor)

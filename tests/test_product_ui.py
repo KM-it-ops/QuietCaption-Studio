@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QApplication
 from quietcaption.languages import default_registry
 from quietcaption.models import built_in_catalog
 from quietcaption.models import ModelRegistry
+from quietcaption.pipeline import PipelineResult
 from quietcaption.settings import AppSettings, SettingsStore
 from quietcaption.ui.main_window import MainWindow
 from quietcaption.ui.models_view import ModelsView
@@ -179,3 +180,17 @@ def test_technical_settings_search_navigates_compact_sections(qtbot, tmp_path):
     view.settings_search.setText("subtitle font")
 
     assert view.tabs.currentIndex() == 3
+
+
+def test_finish_queue_handles_skipped_pipeline_result(qtbot, tmp_path):
+    window = MainWindow(demo=True, settings_store=SettingsStore(tmp_path / "settings.json"))
+    qtbot.addWidget(window)
+    original_page_count = window.pages.count()
+    window._completed_jobs = 0
+    window._last_result = PipelineResult(None, [], skipped=True)
+
+    window._finish_queue()
+
+    assert window.pages.count() == original_page_count
+    assert window.queue_status.text() == "Job skipped — existing output kept"
+    assert window.statusBar().currentMessage() == "Skipped because output already exists"

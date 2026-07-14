@@ -155,6 +155,25 @@ def test_replace_atomically_publishes_exports_after_success(tmp_path, monkeypatc
     assert not export_replacement[0].exists()
 
 
+def test_export_partial_temp_is_removed_when_write_raises(tmp_path, monkeypatch):
+    source = source_file(tmp_path)
+    output = tmp_path / "out"
+    real_write_text = Path.write_text
+
+    def partial_write_then_fail(path, content, *args, **kwargs):
+        if ".srt." in path.name and path.name.endswith(".tmp"):
+            real_write_text(path, "partial", encoding="utf-8")
+            raise OSError("disk write failed")
+        return real_write_text(path, content, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", partial_write_then_fail)
+
+    with pytest.raises(OSError, match="disk write failed"):
+        SubtitlePipeline(RecordingMedia(), Transcriber()).run(request(source, output, "replace"))
+
+    assert not list(output.glob("*.tmp"))
+
+
 def test_reservation_prevents_nested_job_from_claiming_same_namespace(tmp_path):
     source = source_file(tmp_path)
     output = tmp_path / "out"
@@ -173,6 +192,27 @@ def test_reservation_prevents_nested_job_from_claiming_same_namespace(tmp_path):
     assert nested_results[0].project_path == output / "clip (2).qcp"
 
 
+def test_reservation_acquire_survives_another_reservation_release(tmp_path, monkeypatch):
+    output = tmp_path / "out"
+    output.mkdir()
+    first = pipeline_module._NamespaceReservation(output, "first")
+    second = pipeline_module._NamespaceReservation(output, "second")
+    assert first.acquire()
+    real_open = pipeline_module.os.open
+
+    def release_first_before_second_open(path, flags):
+        if Path(path) == second.path:
+            first.release()
+        return real_open(path, flags)
+
+    monkeypatch.setattr(pipeline_module.os, "open", release_first_before_second_open)
+
+    assert second.acquire()
+    second.release()
+    assert not first.path.exists()
+    assert not second.path.exists()
+
+
 def test_reservation_is_released_after_failure(tmp_path):
     source = source_file(tmp_path)
     output = tmp_path / "out"
@@ -183,6 +223,26 @@ def test_reservation_is_released_after_failure(tmp_path):
     result = SubtitlePipeline(RecordingMedia(), Transcriber()).run(request(source, output, "increment"))
     assert result.project_path == output / "clip.qcp"
     assert not (output / ".quietcaption-reservations").exists()
+
+
+def test_reservation_is_released_after_application_cancellation(tmp_path):
+    source = source_file(tmp_path)
+    output = tmp_path / "out"
+    cancel = type("Token", (), {"cancelled": True})()
+
+    class CancelAwareTranscriber:
+        def transcribe(self, path, language="auto", progress=None, cancel=None):
+            assert cancel.cancelled
+            raise InterruptedError("Transcription cancelled")
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        SubtitlePipeline(RecordingMedia(), CancelAwareTranscriber()).run(
+            request(source, output, "increment"), cancel=cancel
+        )
+
+    result = SubtitlePipeline(RecordingMedia(), Transcriber()).run(request(source, output, "increment"))
+    assert result.project_path == output / "clip.qcp"
+    assert not list(output.glob(".quietcaption-reservation-*.lock"))
 
 
 def test_invalid_collision_policy_is_rejected_before_processing(tmp_path):
