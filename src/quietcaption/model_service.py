@@ -220,16 +220,23 @@ class ModelService:
         if not self.registry.is_installed(descriptor.id) or not manifest.exists():
             return False
         try:
+            resolved_root = root.resolve(strict=True)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             if payload.get("revision") != descriptor.revision:
                 return False
             expected_files = payload.get("files", {})
-            return bool(expected_files) and all(
-                root.joinpath(relative).is_file()
-                and _sha256(root / relative) == expected
-                for relative, expected in expected_files.items()
-            )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            if not isinstance(expected_files, dict) or not expected_files:
+                return False
+            for relative, expected in expected_files.items():
+                if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+                    return False
+                candidate = resolved_root.joinpath(relative).resolve(strict=True)
+                if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
+                    return False
+                if _sha256(candidate) != expected:
+                    return False
+            return True
+        except (OSError, ValueError, TypeError, RuntimeError, json.JSONDecodeError):
             return False
 
     def remove(self, descriptor: ModelDescriptor, force: bool = False) -> None:

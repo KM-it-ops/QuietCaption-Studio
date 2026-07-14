@@ -1,3 +1,5 @@
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -240,3 +242,65 @@ def test_model_mutations_are_blocked_by_live_runtime_lease(tmp_path, operation):
         assert destination.joinpath(descriptor.id).is_dir()
     else:
         assert fetches == [("owner/demo", "abc")]
+
+
+def _service_with_manifest_entry(tmp_path, relative, target_bytes=b"outside"):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"model")
+
+    service = ModelService(ModelRegistry(tmp_path / "models", [descriptor]), fetcher=fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    manifest = service.registry.root / descriptor.id / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "id": descriptor.id,
+                "kind": descriptor.kind,
+                "revision": descriptor.revision,
+                "repo_id": descriptor.url,
+                "files": {relative: hashlib.sha256(target_bytes).hexdigest()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return service, descriptor
+
+
+def test_runtime_manifest_rejects_absolute_file_entry(tmp_path):
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    service, descriptor = _service_with_manifest_entry(tmp_path, str(outside))
+
+    assert not service.verify(descriptor)
+    with pytest.raises(ValueError, match="manifest"):
+        service.acquire_runtime(("transcription",))
+
+
+def test_runtime_manifest_rejects_parent_traversal_entry(tmp_path):
+    outside = tmp_path / "models" / "outside.bin"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"outside")
+    service, descriptor = _service_with_manifest_entry(tmp_path, "../outside.bin")
+
+    assert not service.verify(descriptor)
+    with pytest.raises(ValueError, match="manifest"):
+        service.acquire_runtime(("transcription",))
+
+
+def test_runtime_manifest_rejects_symlink_escape(tmp_path):
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    model_link = tmp_path / "models" / "demo" / "link.bin"
+    service, descriptor = _service_with_manifest_entry(tmp_path, "link.bin")
+    try:
+        model_link.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"Windows symlink creation is unavailable: {exc}")
+
+    assert not service.verify(descriptor)
+    with pytest.raises(ValueError, match="manifest"):
+        service.acquire_runtime(("transcription",))
