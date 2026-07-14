@@ -1,5 +1,6 @@
 import hashlib
 import json
+import multiprocessing
 import os
 import threading
 import time
@@ -7,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from quietcaption.model_service import ModelRuntime, ModelService
+from quietcaption.model_operation_lock import ModelOperationLock
+from quietcaption.model_service import ModelOperationBusy, ModelRuntime, ModelService
 from quietcaption.models import ModelDescriptor, ModelRegistry
 
 
@@ -129,9 +131,8 @@ def test_registry_mutations_fail_busy_before_changing_filesystem(tmp_path):
     try:
         before = (_tree_snapshot(root), _tree_snapshot(destination))
         for operation, mutate in operations.items():
-            with pytest.raises(RuntimeError, match=operation) as busy:
+            with pytest.raises(ModelOperationBusy, match=operation):
                 mutate()
-            assert type(busy.value).__name__ == "ModelOperationBusy"
             assert (_tree_snapshot(root), _tree_snapshot(destination)) == before
     finally:
         release.set()
@@ -173,26 +174,150 @@ def test_failed_repair_is_one_transaction_and_preserves_bytes_and_active_pointer
 
     assert _tree_snapshot(root / descriptor.id) == before_model
     assert root.joinpath("active-transcription.json").read_bytes() == before_pointer
-    assert not root.joinpath(f".{descriptor.id}.installing").exists()
+    assert not tuple(root.glob(f".{descriptor.id}.installing.*"))
 
 
-def test_model_mutation_recovers_an_aged_malformed_lock(tmp_path):
-    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+def _hold_os_file_lock(path, payload, aged, ready, release):
+    path = Path(path)
+    path.write_bytes(payload)
+    if aged:
+        old = time.time() - 60
+        os.utime(path, (old, old))
+    handle = path.open("r+b")
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    ready.set()
+    release.wait(5)
+    if os.name == "nt":
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    handle.close()
+
+
+@pytest.mark.parametrize(
+    ("payload", "aged"),
+    [
+        (b'{"pid":99999999,"token":"stale-owner","created_at":0}', False),
+        (b"aged malformed owner metadata", True),
+    ],
+)
+def test_model_operation_lock_never_unlinks_a_live_os_locked_owner(tmp_path, payload, aged):
     root = tmp_path / "models"
     root.mkdir()
     lock_path = tmp_path / ".models.model-operation.lock"
-    lock_path.write_text("interrupted metadata", encoding="utf-8")
-    old = time.time() - 60
-    os.utime(lock_path, (old, old))
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    release = context.Event()
+    owner = context.Process(target=_hold_os_file_lock, args=(lock_path, payload, aged, ready, release))
+    owner.start()
+    try:
+        assert ready.wait(5), "lock owner did not reach the deterministic barrier"
+        contender = ModelOperationLock(root)
+        assert contender.acquire() is False
+    finally:
+        release.set()
+        owner.join(5)
+        if owner.is_alive():
+            owner.terminate()
+            owner.join(5)
+
+    assert owner.exitcode == 0
+    assert lock_path.read_bytes() == payload
+    available = ModelOperationLock(root)
+    assert available.acquire() is True
+    available.release()
+    assert lock_path.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    ("payload", "aged"),
+    [
+        (b'{"pid":99999999,"token":"stale-owner","created_at":0}', False),
+        (b"aged malformed owner metadata", True),
+    ],
+)
+def test_unlocked_stale_lockfile_is_reused_without_read_then_unlink_recovery(tmp_path, payload, aged):
+    root = tmp_path / "models"
+    root.mkdir()
+    lock_path = tmp_path / ".models.model-operation.lock"
+    lock_path.write_bytes(payload)
+    if aged:
+        old = time.time() - 60
+        os.utime(lock_path, (old, old))
+
+    operation_lock = ModelOperationLock(root)
+    assert operation_lock.acquire() is True
+    operation_lock.release()
+
+    assert lock_path.read_bytes() == payload
+
+
+@pytest.mark.parametrize("operation", ["remove", "update", "repair", "move"])
+def test_runtime_lease_blocks_same_root_mutation_across_service_instances(tmp_path, operation):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    root = tmp_path / "models"
+    fetches = []
+
+    def fetch(repo_id, revision, local_dir):
+        fetches.append((repo_id, revision))
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"model")
+
+    service_a = ModelService(ModelRegistry(root, [descriptor]), fetcher=fetch)
+    service_a.install(descriptor)
+    service_a.activate(descriptor)
+    lease = service_a.acquire_runtime(("transcription",))
+    service_b = ModelService(ModelRegistry(root / ".", [descriptor]), fetcher=fetch)
+    destination = tmp_path / "moved-models"
+    fetches.clear()
+
+    def mutate():
+        if operation == "remove":
+            return service_b.remove(descriptor, force=True)
+        if operation == "update":
+            return service_b.update(descriptor)
+        if operation == "repair":
+            return service_b.repair(descriptor)
+        return service_b.move(destination)
+
+    before = (_tree_snapshot(root), _tree_snapshot(destination))
+    with pytest.raises(ValueError, match="in use"):
+        mutate()
+    assert (_tree_snapshot(root), _tree_snapshot(destination)) == before
+    assert fetches == []
+
+    lease.release()
+    lease.release()
+    mutate()
+
+
+def test_runtime_lease_counts_are_isolated_between_distinct_registry_roots(tmp_path):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
 
     def fetch(repo_id, revision, local_dir):
         local_dir.mkdir(parents=True)
-        local_dir.joinpath("model.bin").write_bytes(b"working")
+        local_dir.joinpath("model.bin").write_bytes(b"model")
 
-    service = ModelService(ModelRegistry(root, [descriptor]), fetcher=fetch)
+    service_a = ModelService(ModelRegistry(tmp_path / "models-a", [descriptor]), fetcher=fetch)
+    service_b = ModelService(ModelRegistry(tmp_path / "models-b", [descriptor]), fetcher=fetch)
+    for service in (service_a, service_b):
+        service.install(descriptor)
+        service.activate(descriptor)
 
-    assert service.install(descriptor).joinpath(".complete").is_file()
-    assert not lock_path.exists()
+    lease = service_a.acquire_runtime(("transcription",))
+    service_b.remove(descriptor, force=True)
+    lease.release()
+
+    assert not service_b.registry.root.joinpath(descriptor.id).exists()
 
 
 def test_move_rolls_back_when_destination_verification_fails(tmp_path):
@@ -250,7 +375,7 @@ def test_install_swap_failure_restores_previous_model(tmp_path, monkeypatch):
     real_replace = module.os.replace
 
     def fail_new_install(source, target):
-        if Path(source).name == ".demo.installing" and Path(target).name == "demo":
+        if Path(source).name.startswith(".demo.installing") and Path(target).name == "demo":
             raise OSError("simulated disk failure")
         return real_replace(source, target)
 
@@ -261,6 +386,141 @@ def test_install_swap_failure_restores_previous_model(tmp_path, monkeypatch):
         service.install(descriptor)
 
     assert destination.joinpath("model.bin").read_bytes() == b"working-v1"
+
+
+@pytest.mark.parametrize("failure_point", ["second_install", "second_activation"])
+def test_automated_setup_rolls_back_every_model_and_active_pointer(tmp_path, monkeypatch, failure_point):
+    old_transcription = ModelDescriptor("old-transcription", "transcription", {"en"}, 1, "old/transcription", "0" * 64, revision="old")
+    old_translation = ModelDescriptor("old-translation", "translation", {"en"}, 1, "old/translation", "1" * 64, revision="old")
+    new_transcription = ModelDescriptor("new-transcription", "transcription", {"en"}, 1, "new/transcription", "2" * 64, revision="new")
+    new_translation = ModelDescriptor("new-translation", "translation", {"en"}, 1, "new/translation", "3" * 64, revision="new")
+    catalog = [old_transcription, old_translation, new_transcription, new_translation]
+    root = tmp_path / "models"
+
+    def initial_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(repo_id.encode("ascii"))
+
+    service = ModelService(ModelRegistry(root, catalog), fetcher=initial_fetch)
+    for descriptor in (old_transcription, old_translation):
+        service.install(descriptor)
+        service.activate(descriptor)
+    before = _tree_snapshot(root)
+
+    def bundle_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(f"replacement:{repo_id}".encode("ascii"))
+        if failure_point == "second_install" and repo_id == new_translation.url:
+            raise RuntimeError("second installation failed")
+
+    service.fetcher = bundle_fetch
+    if failure_point == "second_activation":
+        import quietcaption.model_service as module
+
+        real_replace = module.os.replace
+        activation_failed = False
+
+        def fail_translation_activation(source, target):
+            nonlocal activation_failed
+            if Path(target).name == "active-translation.json" and not activation_failed:
+                activation_failed = True
+                raise OSError("second activation failed")
+            return real_replace(source, target)
+
+        monkeypatch.setattr(module.os, "replace", fail_translation_activation)
+
+    with pytest.raises((OSError, RuntimeError), match="second .* failed"):
+        service.install_and_activate((new_transcription, new_translation))
+
+    assert _tree_snapshot(root) == before
+    assert service.active("transcription") == old_transcription
+    assert service.active("translation") == old_translation
+
+
+def test_repair_activation_failure_restores_previous_bytes_and_pointer(tmp_path, monkeypatch):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    root = tmp_path / "models"
+
+    def initial_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"original")
+
+    service = ModelService(ModelRegistry(root, [descriptor]), fetcher=initial_fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    before = _tree_snapshot(root)
+
+    def replacement_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"replacement")
+
+    service.fetcher = replacement_fetch
+    import quietcaption.model_service as module
+
+    real_replace = module.os.replace
+    activation_failed = False
+
+    def fail_activation(source, target):
+        nonlocal activation_failed
+        if Path(target).name == "active-transcription.json" and not activation_failed:
+            activation_failed = True
+            raise OSError("activation failed")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", fail_activation)
+
+    with pytest.raises(OSError, match="activation failed"):
+        service.repair(descriptor)
+
+    assert _tree_snapshot(root) == before
+    assert service.active("transcription") == descriptor
+
+
+def test_install_preserves_foreign_fixed_name_artifacts_and_cleans_unique_failure_paths(tmp_path):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    root = tmp_path / "models"
+    foreign_staging = root / ".demo.installing"
+    foreign_backup = root / ".demo.previous"
+    foreign_staging.mkdir(parents=True)
+    foreign_backup.mkdir()
+    foreign_staging.joinpath("sentinel.bin").write_bytes(b"foreign staging")
+    foreign_backup.joinpath("sentinel.bin").write_bytes(b"foreign backup")
+
+    def failed_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("partial.bin").write_bytes(b"owned partial")
+        raise RuntimeError("injected fetch failure")
+
+    service = ModelService(ModelRegistry(root, [descriptor]), fetcher=failed_fetch)
+    with pytest.raises(RuntimeError, match="injected fetch failure"):
+        service.install(descriptor)
+
+    assert foreign_staging.joinpath("sentinel.bin").read_bytes() == b"foreign staging"
+    assert foreign_backup.joinpath("sentinel.bin").read_bytes() == b"foreign backup"
+    assert not tuple(root.glob(".demo.installing.*"))
+    assert not tuple(root.glob(".demo.previous.*"))
+
+
+def test_move_preserves_foreign_fixed_name_artifact_and_cleans_unique_failure_path(tmp_path):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"model")
+
+    service = ModelService(ModelRegistry(tmp_path / "models", [descriptor]), fetcher=fetch)
+    service.install(descriptor)
+    destination = tmp_path / "moved-models"
+    foreign_staging = tmp_path / ".moved-models.moving"
+    foreign_staging.mkdir()
+    foreign_staging.joinpath("sentinel.bin").write_bytes(b"foreign move")
+
+    with pytest.raises(ValueError, match="integrity"):
+        service.move(destination, verifier=lambda _: False)
+
+    assert foreign_staging.joinpath("sentinel.bin").read_bytes() == b"foreign move"
+    assert not tuple(tmp_path.glob(".moved-models.moving.*"))
+    assert service.registry.root.joinpath(descriptor.id).is_dir()
 
 
 def test_acquire_runtime_requires_a_complete_verified_active_installation(tmp_path):

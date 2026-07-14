@@ -43,7 +43,7 @@ class ModelsView(QWidget):
             item.setData(Qt.UserRole, model.id); self.model_list.addItem(item)
         actions = QHBoxLayout()
         self.install_button = QPushButton("Install selected"); self.update_button = QPushButton("Update"); self.verify_button = QPushButton("Verify"); self.repair_button = QPushButton("Repair"); self.activate_button = QPushButton("Activate"); self.remove_button = QPushButton("Remove")
-        self._lifecycle_controls = (self.install_button, self.update_button, self.repair_button, self.activate_button, self.remove_button, self.setup_panel.automated_button)
+        self._lifecycle_controls = (self.install_button, self.update_button, self.verify_button, self.repair_button, self.activate_button, self.remove_button, self.setup_panel.automated_button)
         self._lifecycle_busy = False
         self._lifecycle_control_states = {}
         self._workers = set()
@@ -88,6 +88,7 @@ class ModelsView(QWidget):
         return next((model for model in self.catalog if item and model.id == item.data(Qt.UserRole)), None)
 
     def _verify(self):
+        if self._lifecycle_busy: return
         model = self._selected(); self.status.setText("Select a model first." if model is None else (f"{model.id} passed integrity verification." if self.service.verify(model) else f"{model.id} is missing or needs repair."))
 
     def _repair(self):

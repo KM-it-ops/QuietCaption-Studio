@@ -6,8 +6,10 @@ import os
 import shutil
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterable
+from uuid import uuid4
 
 from .model_operation_lock import ModelOperationLock
 from .models import ModelDescriptor, ModelRegistry
@@ -19,23 +21,39 @@ class ModelRuntime:
     path: Path
 
 
+@dataclass
+class _RegistryUseState:
+    lock: threading.RLock = field(default_factory=threading.RLock)
+    counts: dict[str, int] = field(default_factory=dict)
+
+
+_registry_states_guard = threading.Lock()
+_registry_states: dict[Path, _RegistryUseState] = {}
+
+
+def _registry_use_state(registry_root: Path) -> _RegistryUseState:
+    normalized_root = Path(registry_root).resolve()
+    with _registry_states_guard:
+        return _registry_states.setdefault(normalized_root, _RegistryUseState())
+
+
 class ModelUseLease:
-    def __init__(self, service: "ModelService", runtimes: tuple[ModelRuntime, ...]):
-        self._service = service
+    def __init__(self, state: _RegistryUseState, runtimes: tuple[ModelRuntime, ...]):
+        self._state = state
         self.runtimes = runtimes
         self._released = False
 
     def release(self) -> None:
-        with self._service._lock:
+        with self._state.lock:
             if self._released:
                 return
             for runtime in self.runtimes:
                 model_id = runtime.descriptor.id
-                remaining = self._service._use_counts[model_id] - 1
+                remaining = self._state.counts[model_id] - 1
                 if remaining:
-                    self._service._use_counts[model_id] = remaining
+                    self._state.counts[model_id] = remaining
                 else:
-                    del self._service._use_counts[model_id]
+                    del self._state.counts[model_id]
             self._released = True
 
     def __enter__(self) -> "ModelUseLease":
@@ -53,6 +71,80 @@ class ModelOperationBusy(RuntimeError):
             f"Model registry at {self.registry_root} is busy with another lifecycle mutation; "
             f"cannot start {operation}. Wait for the current operation to finish and retry."
         )
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+class _MutationJournal:
+    """Own reversible model swaps and pointer snapshots until commit."""
+
+    def __init__(self) -> None:
+        self._undo: list[tuple[str, Path, Path | bytes | None]] = []
+        self._owned_artifacts: set[Path] = set()
+        self._captured_pointers: set[Path] = set()
+
+    def __enter__(self) -> "_MutationJournal":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        if exc_type is None:
+            self.commit()
+        else:
+            self.rollback()
+        return False
+
+    def claim(self, path: Path) -> None:
+        self._owned_artifacts.add(path)
+
+    def relinquish(self, path: Path) -> None:
+        self._owned_artifacts.discard(path)
+
+    def record_swap(self, destination: Path, backup: Path | None) -> None:
+        self._undo.append(("swap", destination, backup))
+
+    def capture_pointer(self, path: Path) -> None:
+        if path in self._captured_pointers:
+            return
+        previous = path.read_bytes() if path.exists() else None
+        self._captured_pointers.add(path)
+        self._undo.append(("pointer", path, previous))
+
+    def commit(self) -> None:
+        self._cleanup_owned_artifacts()
+        self._undo.clear()
+        self._captured_pointers.clear()
+
+    def rollback(self) -> None:
+        for action, path, previous in reversed(self._undo):
+            if action == "swap":
+                if path.exists():
+                    _remove_path(path)
+                if isinstance(previous, Path) and previous.exists():
+                    os.replace(previous, path)
+                    self.relinquish(previous)
+                continue
+            if previous is None:
+                path.unlink(missing_ok=True)
+            else:
+                temporary = path.with_name(f".{path.name}.rollback.{uuid4().hex}")
+                self.claim(temporary)
+                temporary.write_bytes(previous)
+                os.replace(temporary, path)
+                self.relinquish(temporary)
+        self._cleanup_owned_artifacts()
+        self._undo.clear()
+        self._captured_pointers.clear()
+
+    def _cleanup_owned_artifacts(self) -> None:
+        for path in tuple(self._owned_artifacts):
+            if path.exists():
+                _remove_path(path)
+            self._owned_artifacts.discard(path)
 
 
 def _sha256(path: Path) -> str:
@@ -75,8 +167,6 @@ class ModelService:
     def __init__(self, registry: ModelRegistry, fetcher=None):
         self.registry = registry
         self.fetcher = fetcher or _snapshot_fetcher
-        self._lock = threading.RLock()
-        self._use_counts: dict[str, int] = {}
 
     @contextmanager
     def mutation(self, operation: str):
@@ -85,14 +175,17 @@ class ModelService:
         operation_lock = ModelOperationLock(root)
         if not operation_lock.acquire():
             raise ModelOperationBusy(root, operation)
+        state = _registry_use_state(root)
         try:
-            with self._lock:
+            with state.lock:
                 yield
         finally:
             operation_lock.release()
 
     def acquire_runtime(self, kinds: tuple[str, ...]) -> ModelUseLease:
-        with self._lock:
+        root = self.registry.root.resolve()
+        state = _registry_use_state(root)
+        with state.lock:
             runtimes = []
             for kind in kinds:
                 try:
@@ -103,7 +196,7 @@ class ModelService:
                     raise ValueError(f"No active {kind} model is ready")
                 if descriptor.kind != kind:
                     raise ValueError(f"Active {kind} model pointer selects the wrong model kind")
-                path = self.registry.root / descriptor.id
+                path = root / descriptor.id
                 if not self.registry.is_installed(descriptor.id):
                     raise ValueError(f"Active {kind} model is not installed")
                 marker = path / ".complete"
@@ -128,65 +221,70 @@ class ModelService:
             result = tuple(runtimes)
             for runtime in result:
                 model_id = runtime.descriptor.id
-                self._use_counts[model_id] = self._use_counts.get(model_id, 0) + 1
-            return ModelUseLease(self, result)
+                state.counts[model_id] = state.counts.get(model_id, 0) + 1
+            return ModelUseLease(state, result)
 
     def install(self, descriptor: ModelDescriptor) -> Path:
         with self.mutation("install"):
             self._assert_not_in_use(descriptor.id)
-            return self._install_unlocked(descriptor)
+            with _MutationJournal() as journal:
+                return self._install_unlocked(descriptor, journal)
 
-    def _install_unlocked(self, descriptor: ModelDescriptor) -> Path:
+    def _install_unlocked(self, descriptor: ModelDescriptor, journal: _MutationJournal) -> Path:
         self.registry.root.mkdir(parents=True, exist_ok=True)
         destination = self.registry.root / descriptor.id
-        staging = self.registry.root / f".{descriptor.id}.installing"
-        backup = self.registry.root / f".{descriptor.id}.previous"
-        if staging.exists(): shutil.rmtree(staging)
-        try:
-            self.fetcher(descriptor.url, descriptor.revision, staging)
-            files = [item for item in staging.rglob("*") if item.is_file()]
-            if not files:
-                raise ValueError("Downloaded model snapshot is empty")
-            file_hashes = {
-                item.relative_to(staging).as_posix(): _sha256(item)
-                for item in files
-            }
-            (staging / "manifest.json").write_text(json.dumps({"id": descriptor.id, "kind": descriptor.kind, "revision": descriptor.revision, "repo_id": descriptor.url, "files": file_hashes}, indent=2), encoding="utf-8")
-            (staging / ".complete").write_text(descriptor.revision, encoding="ascii")
-            if backup.exists(): shutil.rmtree(backup)
-            if destination.exists(): os.replace(destination, backup)
-            os.replace(staging, destination)
-            if backup.exists(): shutil.rmtree(backup)
-            return destination
-        except Exception:
-            if staging.exists(): shutil.rmtree(staging)
-            if backup.exists() and not destination.exists():
-                os.replace(backup, destination)
-            raise
+        operation_id = uuid4().hex
+        staging = self.registry.root / f".{descriptor.id}.installing.{operation_id}"
+        backup = self.registry.root / f".{descriptor.id}.previous.{operation_id}"
+        if staging.exists() or backup.exists():
+            raise RuntimeError(f"Unique install workspace already exists for {descriptor.id}; retry the operation")
+        journal.claim(staging)
+        self.fetcher(descriptor.url, descriptor.revision, staging)
+        files = [item for item in staging.rglob("*") if item.is_file()]
+        if not files:
+            raise ValueError("Downloaded model snapshot is empty")
+        file_hashes = {
+            item.relative_to(staging).as_posix(): _sha256(item)
+            for item in files
+        }
+        (staging / "manifest.json").write_text(json.dumps({"id": descriptor.id, "kind": descriptor.kind, "revision": descriptor.revision, "repo_id": descriptor.url, "files": file_hashes}, indent=2), encoding="utf-8")
+        (staging / ".complete").write_text(descriptor.revision, encoding="ascii")
+        previous = None
+        if destination.exists():
+            os.replace(destination, backup)
+            journal.claim(backup)
+            previous = backup
+        journal.record_swap(destination, previous)
+        os.replace(staging, destination)
+        journal.relinquish(staging)
+        return destination
 
     def update(self, descriptor: ModelDescriptor) -> Path:
         """Install the catalog revision without risking the current installation."""
         with self.mutation("update"):
             self._assert_not_in_use(descriptor.id)
-            return self._install_unlocked(descriptor)
+            with _MutationJournal() as journal:
+                return self._install_unlocked(descriptor, journal)
 
     def repair(self, descriptor: ModelDescriptor) -> Path:
         with self.mutation("repair"):
             self._assert_not_in_use(descriptor.id)
             was_active = self._active_unlocked(descriptor.kind) == descriptor
-            installed = self._install_unlocked(descriptor)
-            if was_active:
-                self._activate_unlocked(descriptor)
-            return installed
+            with _MutationJournal() as journal:
+                installed = self._install_unlocked(descriptor, journal)
+                if was_active:
+                    self._activate_unlocked(descriptor, journal)
+                return installed
 
-    def install_and_activate(self, descriptors) -> tuple[ModelDescriptor, ...]:
+    def install_and_activate(self, descriptors: Iterable[ModelDescriptor]) -> tuple[ModelDescriptor, ...]:
         """Install and activate an automated model bundle in one transaction."""
         models = tuple(descriptors)
         with self.mutation("automated setup"):
             self._assert_not_in_use(*(descriptor.id for descriptor in models))
-            for descriptor in models:
-                self._install_unlocked(descriptor)
-                self._activate_unlocked(descriptor)
+            with _MutationJournal() as journal:
+                for descriptor in models:
+                    self._install_unlocked(descriptor, journal)
+                    self._activate_unlocked(descriptor, journal)
         return models
 
     def move(self, destination: Path, verifier=None) -> Path:
@@ -209,9 +307,10 @@ class ModelService:
             return destination
         if destination.exists() and any(destination.iterdir()):
             raise ValueError("Destination model folder must be empty")
-        staging = destination.with_name(f".{destination.name}.moving")
+        staging = destination.with_name(f".{destination.name}.moving.{uuid4().hex}")
         if staging.exists():
-            shutil.rmtree(staging)
+            raise RuntimeError("Unique move workspace already exists; retry the operation")
+        destination_was_empty = destination.exists()
         try:
             shutil.copytree(source, staging)
             verify_copy = verifier or self._verify_registry_copy
@@ -226,6 +325,8 @@ class ModelService:
         except Exception:
             if staging.exists():
                 shutil.rmtree(staging)
+            if destination_was_empty and not destination.exists():
+                destination.mkdir(parents=True)
             raise
 
     def _verify_registry_copy(self, root: Path) -> bool:
@@ -238,19 +339,25 @@ class ModelService:
 
     def activate(self, descriptor: ModelDescriptor) -> ModelDescriptor:
         with self.mutation("activate"):
-            return self._activate_unlocked(descriptor)
+            with _MutationJournal() as journal:
+                return self._activate_unlocked(descriptor, journal)
 
-    def _activate_unlocked(self, descriptor: ModelDescriptor) -> ModelDescriptor:
+    def _activate_unlocked(self, descriptor: ModelDescriptor, journal: _MutationJournal) -> ModelDescriptor:
         if not self.registry.is_installed(descriptor.id):
             raise ValueError("Model must be installed before activation")
         active = self.registry.root / f"active-{descriptor.kind}.json"
-        temporary = active.with_suffix(".tmp")
+        journal.capture_pointer(active)
+        temporary = active.with_name(f".{active.name}.tmp.{uuid4().hex}")
+        if temporary.exists():
+            raise RuntimeError(f"Unique activation workspace already exists for {descriptor.kind}; retry the operation")
+        journal.claim(temporary)
         temporary.write_text(json.dumps({"id": descriptor.id}), encoding="utf-8")
         os.replace(temporary, active)
+        journal.relinquish(temporary)
         return descriptor
 
     def active(self, kind: str) -> ModelDescriptor | None:
-        with self._lock:
+        with _registry_use_state(self.registry.root.resolve()).lock:
             return self._active_unlocked(kind)
 
     def _active_unlocked(self, kind: str) -> ModelDescriptor | None:
@@ -298,6 +405,7 @@ class ModelService:
         if force and self._active_unlocked(descriptor.kind) == descriptor: active.unlink(missing_ok=True)
 
     def _assert_not_in_use(self, *model_ids: str) -> None:
-        in_use = [model_id for model_id in model_ids if self._use_counts.get(model_id, 0)]
+        counts = _registry_use_state(self.registry.root.resolve()).counts
+        in_use = [model_id for model_id in model_ids if counts.get(model_id, 0)]
         if in_use:
             raise ValueError(f"Model is in use: {', '.join(in_use)}")

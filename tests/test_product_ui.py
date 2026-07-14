@@ -66,6 +66,7 @@ def test_model_lifecycle_busy_disables_all_mutations_and_restores_controls(qtbot
     class Service:
         def __init__(self):
             self.install_calls = []
+            self.verify_calls = []
             self.activate_calls = []
             self.remove_calls = []
 
@@ -75,7 +76,7 @@ def test_model_lifecycle_busy_disables_all_mutations_and_restores_controls(qtbot
                 raise RuntimeError("disk unavailable")
             return Path("model")
 
-        def verify(self, descriptor): return True
+        def verify(self, descriptor): self.verify_calls.append(descriptor.id); return True
         def activate(self, descriptor): self.activate_calls.append(descriptor.id); return descriptor
         def remove(self, descriptor, force=False): self.remove_calls.append(descriptor.id)
 
@@ -97,16 +98,20 @@ def test_model_lifecycle_busy_disables_all_mutations_and_restores_controls(qtbot
     conflicting = (
         view.install_button,
         view.update_button,
+        view.verify_button,
         view.repair_button,
         view.activate_button,
         view.remove_button,
         view.setup_panel.automated_button,
     )
     assert all(not button.isEnabled() for button in conflicting)
-    assert view.verify_button.isEnabled()
     assert len(pool.workers) == 1
     assert len(view._workers) == 1
 
+    lifecycle_status = view.status.text()
+    view._verify()
+    assert service.verify_calls == []
+    assert view.status.text() == lifecycle_status
     view._activate()
     view._remove()
     assert service.activate_calls == []

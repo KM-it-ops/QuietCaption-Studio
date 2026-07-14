@@ -1,110 +1,89 @@
 from __future__ import annotations
 
-import json
+import errno
 import os
 import threading
-import time
 from pathlib import Path
-from uuid import uuid4
+from typing import BinaryIO
 
 
 DEFAULT_STALE_AFTER_SECONDS = 30.0
 
 
 class ModelOperationLock:
-    """Immediate registry-scoped lock whose owner alone may release it."""
+    """Immediate registry lock backed by an OS-owned open file handle."""
 
     _process_guard = threading.Lock()
-    _active_tokens: set[str] = set()
+    _active_paths: set[Path] = set()
 
     def __init__(self, registry_root: Path, *, stale_after: float = DEFAULT_STALE_AFTER_SECONDS) -> None:
         self.registry_root = Path(registry_root).resolve()
         self.path = self.registry_root.with_name(f".{self.registry_root.name}.model-operation.lock")
         self.stale_after = stale_after
-        self.token = uuid4().hex
         self.acquired = False
+        self._handle: BinaryIO | None = None
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._process_guard:
-            for attempt in range(2):
-                try:
-                    descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                except FileExistsError:
-                    if attempt == 0 and self._recover_orphaned_lock():
-                        continue
+            if self.path in self._active_paths:
+                return False
+            handle = self.path.open("a+b")
+            try:
+                self._ensure_lock_byte(handle)
+                self._lock_nonblocking(handle)
+            except OSError as exc:
+                handle.close()
+                if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
                     return False
-
-                try:
-                    payload = {"pid": os.getpid(), "token": self.token, "created_at": time.time()}
-                    os.write(descriptor, json.dumps(payload).encode("utf-8"))
-                except Exception:
-                    try:
-                        os.close(descriptor)
-                    finally:
-                        self.path.unlink(missing_ok=True)
-                    raise
-                os.close(descriptor)
-                self._active_tokens.add(self.token)
-                self.acquired = True
-                return True
-        return False
+                raise
+            self._active_paths.add(self.path)
+            self._handle = handle
+            self.acquired = True
+            return True
 
     def release(self) -> None:
         if not self.acquired:
             return
         with self._process_guard:
+            handle = self._handle
             try:
-                payload = json.loads(self.path.read_text(encoding="utf-8"))
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                payload = None
-            try:
-                if isinstance(payload, dict) and payload.get("token") == self.token:
-                    self.path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                if handle is not None:
+                    self._unlock(handle)
             finally:
-                self._active_tokens.discard(self.token)
+                if handle is not None:
+                    handle.close()
+                self._active_paths.discard(self.path)
+                self._handle = None
                 self.acquired = False
 
-    def _recover_orphaned_lock(self) -> bool:
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-            token = payload["token"]
-            pid = int(payload["pid"])
-        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-            return self._recover_aged_unchanged_lock()
-        except OSError:
-            return False
-        if token in self._active_tokens or (pid != os.getpid() and self._pid_running(pid)):
-            return False
-        self.path.unlink(missing_ok=True)
-        return True
-
-    def _recover_aged_unchanged_lock(self) -> bool:
-        try:
-            observed = self.path.stat()
-        except OSError:
-            return False
-        if time.time() - observed.st_mtime < self.stale_after:
-            return False
-        try:
-            current = self.path.stat()
-        except OSError:
-            return False
-        identity = (observed.st_ino, observed.st_size, observed.st_mtime_ns)
-        if identity != (current.st_ino, current.st_size, current.st_mtime_ns):
-            return False
-        try:
-            self.path.unlink()
-        except OSError:
-            return False
-        return True
+    @staticmethod
+    def _ensure_lock_byte(handle: BinaryIO) -> None:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
 
     @staticmethod
-    def _pid_running(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
+    def _lock_nonblocking(handle: BinaryIO) -> None:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    @staticmethod
+    def _unlock(handle: BinaryIO) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
