@@ -48,3 +48,11 @@ Model lifecycle serialization and failure atomicity: complete on 2026-07-14 (com
 - Re-review then found move/remove/journal cleanup failure-atomicity gaps; commit `ad28497` added logical commit points, reversible forced removal, non-fatal owned cleanup warnings, weak root-state retention, and removed obsolete stale-lock configuration.
 - The final allowed re-review found a Critical move-vs-runtime-acquisition stale-root race. Commit `04d5d5c` added explicit-root capture/lock/revalidation/retry and same-root pointer/install/manifest/hash validation plus destination-root lease enforcement.
 - Final independent re-review at `04d5d5c`: approved with no Critical, Important, or Minor findings. Implementer verification: focused `73 passed, 1 skipped`; full suite `222 passed, 1 skipped`; redirected compileall and `git diff --check` passed.
+
+Typed settings schema validation and malformed-file recovery: complete on 2026-07-14 (commit `0aa48ab`).
+
+- Every `AppSettings` field now has an explicit type/domain contract; booleans are not accepted as integers, values are not coerced, and persistence-boundary errors name the exact field.
+- `SettingsLoadResult` distinguishes a missing clean-default file from malformed JSON/schema fallback. Malformed sources remain byte-identical and Settings UI exposes the actionable recovery warning on construction/reload.
+- Legacy migration, compatibility `load()`, portable import/export filtering, reset behavior, and atomic writes remain intact.
+- Independent task review: approved with no Critical or Important findings. Minor follow-up: import read/decoding/JSON failures currently share “could not be parsed” wording; differentiating unreadable files from malformed JSON would improve diagnostics.
+- Implementer verification: RED `35 failed`; new-behavior GREEN `51 passed`; focused `92 passed`; full suite `273 passed, 1 skipped`; redirected compileall and `git diff --check` passed.
