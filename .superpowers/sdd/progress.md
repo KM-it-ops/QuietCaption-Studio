@@ -56,3 +56,11 @@ Typed settings schema validation and malformed-file recovery: complete on 2026-0
 - Legacy migration, compatibility `load()`, portable import/export filtering, reset behavior, and atomic writes remain intact.
 - Independent task review: approved with no Critical or Important findings. Minor follow-up: import read/decoding/JSON failures currently share “could not be parsed” wording; differentiating unreadable files from malformed JSON would improve diagnostics.
 - Implementer verification: RED `35 failed`; new-behavior GREEN `51 passed`; focused `92 passed`; full suite `273 passed, 1 skipped`; redirected compileall and `git diff --check` passed.
+
+Model move byte verification: complete on 2026-07-14 (commit `910196c`).
+
+- Move now captures the explicit source root and installed descriptor tuple before copy, then byte-verifies every staged installed model and validates staged active-role pointers before destination promotion or source deletion.
+- Runtime readiness, installed Verify, and staged moves reuse one strict explicit-root local consistency validator covering exact `.complete` revision, manifest identity, typed SHA-256 entries, path containment, listed hashes, and unlisted-payload rejection.
+- Verification remains explicitly local-manifest consistency; no catalog-trust claim, signature, or authoritative upstream hash was added.
+- Independent task review: approved with no Critical, Important, or Minor findings.
+- Implementer verification: model-service `64 passed, 2 skipped`; full suite `297 passed, 2 skipped`; redirected compileall and `git diff --check` passed. Skips are Windows symlink fixtures denied by `WinError 1314`; absolute/traversal cases pass.
