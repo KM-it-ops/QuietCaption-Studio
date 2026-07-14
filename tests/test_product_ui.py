@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QApplication
 from quietcaption.languages import default_registry
 from quietcaption.models import built_in_catalog
 from quietcaption.models import ModelRegistry
+from quietcaption.models import ModelDescriptor
 from quietcaption.pipeline import PipelineResult
 from quietcaption.settings import AppSettings, SettingsStore
 from quietcaption.ui.main_window import CancellationToken, MainWindow, PipelineWorker
@@ -227,3 +228,57 @@ def test_main_window_cancelled_state_is_non_error(qtbot, monkeypatch):
     assert window.queue_status.text() == "Cancelled — no output was published"
     assert window.statusBar().currentMessage() == "Cancelled"
     assert critical == []
+
+
+def test_production_beam_size_is_snapshotted_for_each_queue(qtbot, tmp_path, monkeypatch):
+    transcription_model = ModelDescriptor(
+        "whisper-small",
+        "transcription",
+        {"*"},
+        500,
+        "local",
+        "0" * 64,
+    )
+
+    class Service:
+        def __init__(self):
+            self.registry = ModelRegistry(tmp_path / "models", [transcription_model])
+
+        def active(self, kind):
+            return transcription_model if kind == "transcription" else None
+
+    class RecordingThreadPool:
+        def __init__(self):
+            self.workers = []
+
+        def start(self, worker):
+            self.workers.append(worker)
+
+    received_options = []
+
+    def recording_transcriber(model, compute, options):
+        received_options.append(options)
+        return object()
+
+    monkeypatch.setattr("quietcaption.ui.main_window.FasterWhisperTranscriber", recording_transcriber)
+    window = MainWindow(
+        demo=False,
+        output_directory=tmp_path / "output",
+        settings_store=SettingsStore(tmp_path / "settings.json"),
+        model_service=Service(),
+    )
+    qtbot.addWidget(window)
+    window.thread_pool = RecordingThreadPool()
+
+    window.new_job.beam_size.setValue(11)
+    window._start_jobs([tmp_path / "first.wav", tmp_path / "second.wav"])
+    window.new_job.beam_size.setValue(3)
+    window._completed(object())
+
+    assert [options.beam_size for options in received_options] == [11, 11]
+    assert received_options[0] is received_options[1]
+
+    window._start_jobs([tmp_path / "third.wav"])
+
+    assert received_options[2].beam_size == 3
+    assert received_options[2] is not received_options[0]

@@ -17,3 +17,15 @@ def test_primary_controls_have_accessible_names(qtbot):
     window = MainWindow(demo=True); qtbot.addWidget(window)
     missing = [button.text() for button in window.findChildren(QAbstractButton) if button.isVisibleTo(window) and not (button.accessibleName() or button.text()).strip()]
     assert missing == []
+
+
+def test_beam_control_preserves_its_value_across_interface_modes(qtbot):
+    window = MainWindow(demo=True); qtbot.addWidget(window)
+    beam = window.new_job.beam_size
+
+    assert (beam.minimum(), beam.maximum(), beam.value()) == (1, 20, 5)
+    beam.setValue(11)
+    window.new_job.set_interface_mode("everyday")
+    window.new_job.set_interface_mode("technical")
+
+    assert beam.value() == 11

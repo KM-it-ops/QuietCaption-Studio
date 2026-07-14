@@ -15,7 +15,7 @@ from ..pipeline import PipelineRequest, SubtitlePipeline
 from ..projects import ProjectStore
 from ..settings import AppSettings
 from ..settings import SettingsStore
-from ..transcription import FasterWhisperTranscriber
+from ..transcription import FasterWhisperTranscriber, TranscriptionOptions
 from ..translation import NllbCTranslate2Translator
 from .editor import SubtitleEditor
 from .new_job import NewJobView
@@ -125,6 +125,9 @@ class MainWindow(QMainWindow):
         self._queue_target = self.new_job.target_language.code()
         self._queue_formats = {"SRT": ["srt"], "VTT": ["vtt"], "SRT + VTT": ["srt", "vtt"], "SRT + VTT + TXT": ["srt", "vtt", "txt"]}[self.new_job.output_format.currentText()]
         self._queue_source_language = self.new_job.source_language.code()
+        self._queue_transcription_options = TranscriptionOptions(
+            beam_size=self.new_job.beam_size.value(),
+        )
         self.navigation.setCurrentRow(1); self.queue_progress.show()
         self.new_job.generate.setEnabled(False)
         self.cancel_button.setEnabled(True)
@@ -151,7 +154,7 @@ class MainWindow(QMainWindow):
                 if translation_model is None:
                     self._failed("No translation model is active. Install and activate one from Models."); return
                 translator = NllbCTranslate2Translator(self.models_page.service.registry.root / translation_model.id, self.compute.device)
-            pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), self.compute), translator)
+            pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), self.compute, self._queue_transcription_options), translator)
         request = PipelineRequest(source, output, targets, self._queue_formats, self._queue_source_language)
         self._cancel_token = CancellationToken()
         worker = PipelineWorker(pipeline, request, self._cancel_token); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed); worker.signals.cancelled.connect(self._cancelled)
