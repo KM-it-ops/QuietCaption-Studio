@@ -1,5 +1,8 @@
 import hashlib
 import json
+import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -75,6 +78,121 @@ def test_repair_reinstalls_model_and_preserves_active_role(tmp_path):
 
     assert service.verify(descriptor)
     assert service.active("transcription") == descriptor
+
+
+def _tree_snapshot(root):
+    if not root.exists():
+        return None
+    return {
+        path.relative_to(root).as_posix(): ("dir" if path.is_dir() else path.read_bytes())
+        for path in sorted(root.rglob("*"))
+    }
+
+
+def test_registry_mutations_fail_busy_before_changing_filesystem(tmp_path):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    root = tmp_path / "models"
+
+    def initial_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"working")
+
+    initial = ModelService(ModelRegistry(root, [descriptor]), fetcher=initial_fetch)
+    initial.install(descriptor)
+    initial.activate(descriptor)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"pending")
+        entered.set()
+        if not release.wait(3):
+            raise TimeoutError("test did not release blocking fetcher")
+
+    holder = ModelService(ModelRegistry(root, [descriptor]), fetcher=blocking_fetch)
+    contender = ModelService(ModelRegistry(root / ".", [descriptor]), fetcher=lambda *_: (_ for _ in ()).throw(AssertionError("busy contender fetched")))
+    holder_errors = []
+    thread = threading.Thread(target=lambda: _capture_error(holder_errors, lambda: holder.install(descriptor)))
+    thread.start()
+    assert entered.wait(3), "blocking fetcher was not reached"
+
+    destination = tmp_path / "moved-models"
+    operations = {
+        "update": lambda: contender.update(descriptor),
+        "repair": lambda: contender.repair(descriptor),
+        "remove": lambda: contender.remove(descriptor, force=True),
+        "activate": lambda: contender.activate(descriptor),
+        "move": lambda: contender.move(destination),
+    }
+    try:
+        before = (_tree_snapshot(root), _tree_snapshot(destination))
+        for operation, mutate in operations.items():
+            with pytest.raises(RuntimeError, match=operation) as busy:
+                mutate()
+            assert type(busy.value).__name__ == "ModelOperationBusy"
+            assert (_tree_snapshot(root), _tree_snapshot(destination)) == before
+    finally:
+        release.set()
+        thread.join(3)
+
+    assert not thread.is_alive()
+    assert holder_errors == []
+
+
+def _capture_error(errors, operation):
+    try:
+        operation()
+    except Exception as exc:
+        errors.append(exc)
+
+
+def test_failed_repair_is_one_transaction_and_preserves_bytes_and_active_pointer(tmp_path):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    root = tmp_path / "models"
+
+    def initial_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"working")
+
+    service = ModelService(ModelRegistry(root, [descriptor]), fetcher=initial_fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    before_model = _tree_snapshot(root / descriptor.id)
+    before_pointer = root.joinpath("active-transcription.json").read_bytes()
+
+    def failed_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"partial")
+        raise RuntimeError("injected repair failure")
+
+    service.fetcher = failed_fetch
+    with pytest.raises(RuntimeError, match="injected repair failure"):
+        service.repair(descriptor)
+
+    assert _tree_snapshot(root / descriptor.id) == before_model
+    assert root.joinpath("active-transcription.json").read_bytes() == before_pointer
+    assert not root.joinpath(f".{descriptor.id}.installing").exists()
+
+
+def test_model_mutation_recovers_an_aged_malformed_lock(tmp_path):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    root = tmp_path / "models"
+    root.mkdir()
+    lock_path = tmp_path / ".models.model-operation.lock"
+    lock_path.write_text("interrupted metadata", encoding="utf-8")
+    old = time.time() - 60
+    os.utime(lock_path, (old, old))
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"working")
+
+    service = ModelService(ModelRegistry(root, [descriptor]), fetcher=fetch)
+
+    assert service.install(descriptor).joinpath(".complete").is_file()
+    assert not lock_path.exists()
 
 
 def test_move_rolls_back_when_destination_verification_fails(tmp_path):

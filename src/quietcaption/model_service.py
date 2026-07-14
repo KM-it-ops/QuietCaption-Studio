@@ -5,9 +5,11 @@ import hashlib
 import os
 import shutil
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from .model_operation_lock import ModelOperationLock
 from .models import ModelDescriptor, ModelRegistry
 
 
@@ -43,6 +45,16 @@ class ModelUseLease:
         self.release()
 
 
+class ModelOperationBusy(RuntimeError):
+    def __init__(self, registry_root: Path, operation: str):
+        self.registry_root = Path(registry_root)
+        self.operation = operation
+        super().__init__(
+            f"Model registry at {self.registry_root} is busy with another lifecycle mutation; "
+            f"cannot start {operation}. Wait for the current operation to finish and retry."
+        )
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -65,6 +77,19 @@ class ModelService:
         self.fetcher = fetcher or _snapshot_fetcher
         self._lock = threading.RLock()
         self._use_counts: dict[str, int] = {}
+
+    @contextmanager
+    def mutation(self, operation: str):
+        """Acquire one immediate mutation transaction for this registry root."""
+        root = self.registry.root.resolve()
+        operation_lock = ModelOperationLock(root)
+        if not operation_lock.acquire():
+            raise ModelOperationBusy(root, operation)
+        try:
+            with self._lock:
+                yield
+        finally:
+            operation_lock.release()
 
     def acquire_runtime(self, kinds: tuple[str, ...]) -> ModelUseLease:
         with self._lock:
@@ -107,11 +132,11 @@ class ModelService:
             return ModelUseLease(self, result)
 
     def install(self, descriptor: ModelDescriptor) -> Path:
-        with self._lock:
+        with self.mutation("install"):
             self._assert_not_in_use(descriptor.id)
-            return self._install(descriptor)
+            return self._install_unlocked(descriptor)
 
-    def _install(self, descriptor: ModelDescriptor) -> Path:
+    def _install_unlocked(self, descriptor: ModelDescriptor) -> Path:
         self.registry.root.mkdir(parents=True, exist_ok=True)
         destination = self.registry.root / descriptor.id
         staging = self.registry.root / f".{descriptor.id}.installing"
@@ -141,14 +166,28 @@ class ModelService:
 
     def update(self, descriptor: ModelDescriptor) -> Path:
         """Install the catalog revision without risking the current installation."""
-        return self.install(descriptor)
+        with self.mutation("update"):
+            self._assert_not_in_use(descriptor.id)
+            return self._install_unlocked(descriptor)
 
     def repair(self, descriptor: ModelDescriptor) -> Path:
-        was_active = self.active(descriptor.kind) == descriptor
-        installed = self.install(descriptor)
-        if was_active:
-            self.activate(descriptor)
-        return installed
+        with self.mutation("repair"):
+            self._assert_not_in_use(descriptor.id)
+            was_active = self._active_unlocked(descriptor.kind) == descriptor
+            installed = self._install_unlocked(descriptor)
+            if was_active:
+                self._activate_unlocked(descriptor)
+            return installed
+
+    def install_and_activate(self, descriptors) -> tuple[ModelDescriptor, ...]:
+        """Install and activate an automated model bundle in one transaction."""
+        models = tuple(descriptors)
+        with self.mutation("automated setup"):
+            self._assert_not_in_use(*(descriptor.id for descriptor in models))
+            for descriptor in models:
+                self._install_unlocked(descriptor)
+                self._activate_unlocked(descriptor)
+        return models
 
     def move(self, destination: Path, verifier=None) -> Path:
         """Move all installed model state after verifying a staged copy.
@@ -156,15 +195,15 @@ class ModelService:
         The source remains untouched until the complete destination copy has
         passed verification, so an interrupted or invalid move is recoverable.
         """
-        with self._lock:
+        with self.mutation("move"):
             installed_ids = tuple(
                 item.id for item in self.registry.catalog
                 if self.registry.is_installed(item.id)
             )
             self._assert_not_in_use(*installed_ids)
-            return self._move(Path(destination), verifier)
+            return self._move_unlocked(Path(destination), verifier)
 
-    def _move(self, destination: Path, verifier=None) -> Path:
+    def _move_unlocked(self, destination: Path, verifier=None) -> Path:
         source = self.registry.root
         if source.resolve() == destination.resolve():
             return destination
@@ -198,21 +237,27 @@ class ModelService:
         )
 
     def activate(self, descriptor: ModelDescriptor) -> ModelDescriptor:
-        with self._lock:
-            if not self.registry.is_installed(descriptor.id):
-                raise ValueError("Model must be installed before activation")
-            active = self.registry.root / f"active-{descriptor.kind}.json"
-            temporary = active.with_suffix(".tmp")
-            temporary.write_text(json.dumps({"id": descriptor.id}), encoding="utf-8")
-            os.replace(temporary, active)
-            return descriptor
+        with self.mutation("activate"):
+            return self._activate_unlocked(descriptor)
+
+    def _activate_unlocked(self, descriptor: ModelDescriptor) -> ModelDescriptor:
+        if not self.registry.is_installed(descriptor.id):
+            raise ValueError("Model must be installed before activation")
+        active = self.registry.root / f"active-{descriptor.kind}.json"
+        temporary = active.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"id": descriptor.id}), encoding="utf-8")
+        os.replace(temporary, active)
+        return descriptor
 
     def active(self, kind: str) -> ModelDescriptor | None:
         with self._lock:
-            path = self.registry.root / f"active-{kind}.json"
-            if not path.exists(): return None
-            model_id = json.loads(path.read_text(encoding="utf-8"))["id"]
-            return next((item for item in self.registry.catalog if item.id == model_id), None)
+            return self._active_unlocked(kind)
+
+    def _active_unlocked(self, kind: str) -> ModelDescriptor | None:
+        path = self.registry.root / f"active-{kind}.json"
+        if not path.exists(): return None
+        model_id = json.loads(path.read_text(encoding="utf-8"))["id"]
+        return next((item for item in self.registry.catalog if item.id == model_id), None)
 
     def verify(self, descriptor: ModelDescriptor) -> bool:
         root = self.registry.root / descriptor.id
@@ -240,14 +285,17 @@ class ModelService:
             return False
 
     def remove(self, descriptor: ModelDescriptor, force: bool = False) -> None:
-        with self._lock:
+        with self.mutation("remove"):
             self._assert_not_in_use(descriptor.id)
-            if self.active(descriptor.kind) == descriptor and not force:
-                raise ValueError("Cannot remove an active model without force")
-            root = self.registry.root / descriptor.id
-            if root.exists(): shutil.rmtree(root)
-            active = self.registry.root / f"active-{descriptor.kind}.json"
-            if force and self.active(descriptor.kind) == descriptor: active.unlink(missing_ok=True)
+            self._remove_unlocked(descriptor, force=force)
+
+    def _remove_unlocked(self, descriptor: ModelDescriptor, force: bool = False) -> None:
+        if self._active_unlocked(descriptor.kind) == descriptor and not force:
+            raise ValueError("Cannot remove an active model without force")
+        root = self.registry.root / descriptor.id
+        if root.exists(): shutil.rmtree(root)
+        active = self.registry.root / f"active-{descriptor.kind}.json"
+        if force and self._active_unlocked(descriptor.kind) == descriptor: active.unlink(missing_ok=True)
 
     def _assert_not_in_use(self, *model_ids: str) -> None:
         in_use = [model_id for model_id in model_ids if self._use_counts.get(model_id, 0)]

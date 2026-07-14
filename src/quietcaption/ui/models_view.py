@@ -43,6 +43,10 @@ class ModelsView(QWidget):
             item.setData(Qt.UserRole, model.id); self.model_list.addItem(item)
         actions = QHBoxLayout()
         self.install_button = QPushButton("Install selected"); self.update_button = QPushButton("Update"); self.verify_button = QPushButton("Verify"); self.repair_button = QPushButton("Repair"); self.activate_button = QPushButton("Activate"); self.remove_button = QPushButton("Remove")
+        self._lifecycle_controls = (self.install_button, self.update_button, self.repair_button, self.activate_button, self.remove_button, self.setup_panel.automated_button)
+        self._lifecycle_busy = False
+        self._lifecycle_control_states = {}
+        self._workers = set()
         for button in (self.install_button, self.update_button, self.verify_button, self.repair_button, self.activate_button, self.remove_button): actions.addWidget(button)
         actions.addStretch()
         self.status = QLabel("Choose Automated setup or Custom setup to configure this computer."); self.status.setObjectName("muted")
@@ -57,30 +61,27 @@ class ModelsView(QWidget):
         if descriptor is None: self.status.setText("Select a model first."); return
         answer = QMessageBox.question(self, "Install local model", f"Download {descriptor.id} ({descriptor.size_mb / 1000:.1f} GB)?\n\nSource: {descriptor.url}\nLicense: {descriptor.license}", QMessageBox.Yes | QMessageBox.No)
         if answer != QMessageBox.Yes: return
-        self.install_button.setEnabled(False); self.status.setText(f"Downloading {descriptor.id} from its pinned revision…")
-        worker = ModelWorker(lambda: self.service.install(descriptor)); worker.signals.completed.connect(lambda _: self._operation_done(f"Installed {descriptor.id}.")); worker.signals.failed.connect(self._operation_failed)
-        self._worker = worker; self.thread_pool.start(worker)
+        self._run_operation(
+            f"Downloading {descriptor.id} from its pinned revision…",
+            lambda: self.service.install(descriptor),
+            lambda _: self.status.setText(f"Installed {descriptor.id}."),
+        )
 
     def _automated_setup(self, plan):
         models = [next(item for item in self.catalog if item.id == plan.transcription_model), next(item for item in self.catalog if item.id == plan.translation_model)]
         answer = QMessageBox.question(self, "Automated local setup", f"Install the recommended offline bundle?\n\nDownload: {plan.download_gb:g} GB\nDisk after installation: {plan.disk_gb:g} GB\n\nNo media or transcripts will be uploaded.", QMessageBox.Yes | QMessageBox.No)
         if answer != QMessageBox.Yes: return
-        self.setup_panel.automated_button.setEnabled(False); self.status.setText("Automated setup is downloading and verifying the recommended models…")
-        def operation():
-            for model in models:
-                self.service.install(model); self.service.activate(model)
-            return models
-        self._automated_models = models
-        worker = ModelWorker(operation); worker.signals.completed.connect(lambda _: self._automated_done()); worker.signals.failed.connect(self._automated_failed)
-        self._worker = worker; self.thread_pool.start(worker)
+        self._run_operation(
+            "Automated setup is downloading and verifying the recommended models…",
+            lambda: self.service.install_and_activate(models),
+            self._automated_done,
+            failure_prefix="Automated setup stopped safely",
+        )
 
-    def _automated_done(self):
-        self.setup_panel.automated_button.setEnabled(True); self.status.setText("Automated setup complete. Transcription and translation models are active.")
-        for model in self._automated_models:
+    def _automated_done(self, models):
+        self.status.setText("Automated setup complete. Transcription and translation models are active.")
+        for model in models:
             self.modelActivated.emit(model)
-
-    def _automated_failed(self, message):
-        self.setup_panel.automated_button.setEnabled(True); self.status.setText(f"Automated setup stopped safely: {message}")
 
     def _selected(self):
         item = self.model_list.currentItem()
@@ -93,28 +94,60 @@ class ModelsView(QWidget):
         model = self._selected()
         if model is None: self.status.setText("Select a model first."); return
         if QMessageBox.question(self, "Repair local model", f"Re-download and repair {model.id}?", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes: return
-        self._run_operation(self.repair_button, f"Repairing {model.id}…", lambda: self.service.repair(model), f"Repaired {model.id}.")
+        self._run_operation(f"Repairing {model.id}…", lambda: self.service.repair(model), lambda _: self.status.setText(f"Repaired {model.id}."))
 
     def _update(self):
         model = self._selected()
         if model is None: self.status.setText("Select a model first."); return
         if QMessageBox.question(self, "Update local model", f"Install the pinned catalog revision for {model.id}?", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes: return
-        self._run_operation(self.update_button, f"Updating {model.id}…", lambda: self.service.update(model), f"Updated {model.id}.")
+        self._run_operation(f"Updating {model.id}…", lambda: self.service.update(model), lambda _: self.status.setText(f"Updated {model.id}."))
 
-    def _run_operation(self, button, pending, operation, completed):
-        button.setEnabled(False); self.status.setText(pending)
+    def _set_lifecycle_busy(self, busy):
+        if busy == self._lifecycle_busy:
+            return
+        self._lifecycle_busy = busy
+        if busy:
+            self._lifecycle_control_states = {control: control.isEnabled() for control in self._lifecycle_controls}
+            for control in self._lifecycle_controls:
+                control.setEnabled(False)
+            return
+        for control, enabled in self._lifecycle_control_states.items():
+            control.setEnabled(enabled)
+        self._lifecycle_control_states = {}
+
+    def _run_operation(self, pending, operation, completed, failure_prefix="Operation stopped safely"):
+        if self._lifecycle_busy:
+            self.status.setText("Another model lifecycle operation is already in progress. Wait for it to finish and retry.")
+            return
+        self._set_lifecycle_busy(True)
+        self.status.setText(pending)
         worker = ModelWorker(operation)
-        worker.signals.completed.connect(lambda _: self._lifecycle_done(button, completed))
-        worker.signals.failed.connect(lambda message: self._lifecycle_failed(button, message))
-        self._worker = worker; self.thread_pool.start(worker)
+        self._workers.add(worker)
+        worker.signals.completed.connect(lambda result, current=worker: self._lifecycle_done(current, completed, result))
+        worker.signals.failed.connect(lambda message, current=worker: self._lifecycle_failed(current, failure_prefix, message))
+        try:
+            self.thread_pool.start(worker)
+        except Exception as exc:
+            self._lifecycle_failed(worker, failure_prefix, str(exc))
 
-    def _lifecycle_done(self, button, message):
-        button.setEnabled(True); self.status.setText(message)
+    def _lifecycle_done(self, worker, completed, result):
+        self._workers.discard(worker)
+        self._set_lifecycle_busy(False)
+        completed(result)
 
-    def _lifecycle_failed(self, button, message):
-        button.setEnabled(True); self.status.setText(f"Operation stopped safely: {message}")
+    def _lifecycle_failed(self, worker, prefix, message):
+        self._workers.discard(worker)
+        self._set_lifecycle_busy(False)
+        self.status.setText(f"{prefix}: {message}")
+
+    def _reject_lifecycle_busy(self):
+        if not self._lifecycle_busy:
+            return False
+        self.status.setText("Another model lifecycle operation is already in progress. Wait for it to finish and retry.")
+        return True
 
     def _activate(self):
+        if self._reject_lifecycle_busy(): return
         model = self._selected()
         try:
             if model is None:
@@ -126,14 +159,9 @@ class ModelsView(QWidget):
         except Exception as exc: self.status.setText(str(exc))
 
     def _remove(self):
+        if self._reject_lifecycle_busy(): return
         model = self._selected()
         if model is None: self.status.setText("Select a model first."); return
         if QMessageBox.question(self, "Remove local model", f"Remove {model.id} from this computer?", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes: return
         try: self.service.remove(model); self.status.setText(f"Removed {model.id}.")
         except Exception as exc: self.status.setText(str(exc))
-
-    def _operation_done(self, message):
-        self.install_button.setEnabled(True); self.status.setText(message)
-
-    def _operation_failed(self, message):
-        self.install_button.setEnabled(True); self.status.setText(f"Installation failed safely: {message}")

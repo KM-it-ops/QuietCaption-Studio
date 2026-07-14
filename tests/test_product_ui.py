@@ -61,6 +61,100 @@ def test_model_install_button_runs_service_and_updates_status(qtbot, monkeypatch
     qtbot.waitUntil(lambda: "Installed" in view.status.text(), timeout=3000)
 
 
+@pytest.mark.parametrize("failure", [False, True])
+def test_model_lifecycle_busy_disables_all_mutations_and_restores_controls(qtbot, monkeypatch, failure):
+    class Service:
+        def __init__(self):
+            self.install_calls = []
+            self.activate_calls = []
+            self.remove_calls = []
+
+        def install(self, descriptor):
+            self.install_calls.append(descriptor.id)
+            if failure:
+                raise RuntimeError("disk unavailable")
+            return Path("model")
+
+        def verify(self, descriptor): return True
+        def activate(self, descriptor): self.activate_calls.append(descriptor.id); return descriptor
+        def remove(self, descriptor, force=False): self.remove_calls.append(descriptor.id)
+
+    class CapturingPool:
+        def __init__(self): self.workers = []
+        def start(self, worker): self.workers.append(worker)
+
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
+    service = Service()
+    view = ModelsView(service=service)
+    qtbot.addWidget(view)
+    pool = CapturingPool()
+    view.thread_pool = pool
+    view.model_list.setCurrentRow(0)
+
+    qtbot.mouseClick(view.install_button, Qt.LeftButton)
+
+    conflicting = (
+        view.install_button,
+        view.update_button,
+        view.repair_button,
+        view.activate_button,
+        view.remove_button,
+        view.setup_panel.automated_button,
+    )
+    assert all(not button.isEnabled() for button in conflicting)
+    assert view.verify_button.isEnabled()
+    assert len(pool.workers) == 1
+    assert len(view._workers) == 1
+
+    view._activate()
+    view._remove()
+    assert service.activate_calls == []
+    assert service.remove_calls == []
+    assert "in progress" in view.status.text().lower()
+
+    pool.workers[0].run()
+
+    assert all(button.isEnabled() for button in conflicting)
+    assert view._workers == set()
+    if failure:
+        assert "stopped safely" in view.status.text().lower()
+        assert "disk unavailable" in view.status.text()
+    else:
+        assert view.status.text() == "Installed whisper-small."
+
+
+def test_automated_setup_uses_one_service_bundle_and_shared_busy_state(qtbot, monkeypatch):
+    class Service:
+        def __init__(self): self.bundles = []
+        def install_and_activate(self, models): self.bundles.append(tuple(model.id for model in models)); return models
+        def verify(self, descriptor): return True
+        def activate(self, descriptor): return descriptor
+        def remove(self, descriptor, force=False): return None
+
+    class CapturingPool:
+        def __init__(self): self.workers = []
+        def start(self, worker): self.workers.append(worker)
+
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
+    service = Service()
+    view = ModelsView(service=service)
+    qtbot.addWidget(view)
+    pool = CapturingPool()
+    view.thread_pool = pool
+
+    qtbot.mouseClick(view.setup_panel.automated_button, Qt.LeftButton)
+
+    assert not view.install_button.isEnabled()
+    assert not view.setup_panel.automated_button.isEnabled()
+    pool.workers[0].run()
+    assert service.bundles == [("whisper-small", "nllb-200-distilled-600m")]
+    assert view.install_button.isEnabled()
+    assert view.setup_panel.automated_button.isEnabled()
+    assert "complete" in view.status.text().lower()
+
+
 def test_production_language_choices_follow_active_models(qtbot, tmp_path):
     catalog = built_in_catalog(default_registry())
 
