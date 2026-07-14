@@ -68,6 +68,17 @@ New-Item -ItemType Directory -Path $base -Force | Out-Null
 .\.venv\Scripts\python.exe -m compileall -q src
 ```
 
+An opt-in weight-backed smoke test is available after explicit approval to download the model bundle:
+
+```powershell
+.\.venv\Scripts\python.exe packaging\real_inference_smoke.py `
+  --model-root .model-smoke\models `
+  --audio .model-smoke\fixture.wav `
+  --download
+```
+
+The harness verifies both manifests, blocks socket connections during inference, performs real Faster-Whisper transcription, and translates the resulting text with the local NLLB CTranslate2 model. The `.model-smoke` directory is intentionally excluded from Git.
+
 ## Build the portable application
 
 ```powershell

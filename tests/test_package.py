@@ -11,7 +11,7 @@ def test_package_has_desktop_entrypoint_and_no_online_translation_dependency():
 
 
 def test_release_files_exist():
-    for path in ["README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "packaging/quietcaption.spec", "packaging/build.ps1", "packaging/smoke.ps1", "packaging/installer.iss"]:
+    for path in ["README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "packaging/quietcaption.spec", "packaging/build.ps1", "packaging/smoke.ps1", "packaging/real_inference_smoke.py", "packaging/installer.iss"]:
         assert Path(path).is_file(), path
 
 
@@ -76,3 +76,11 @@ def test_release_pipeline_smoke_tests_portable_and_installed_apps():
     assert "QuietCaption-Studio-Setup-1.0.0.exe" in smoke
     assert "--demo" in smoke
     assert "/VERYSILENT" in smoke
+
+
+def test_real_inference_smoke_blocks_network_after_model_installation():
+    smoke = Path("packaging/real_inference_smoke.py").read_text(encoding="utf-8")
+    assert 'os.environ["HF_HUB_OFFLINE"] = "1"' in smoke
+    assert "socket.socket.connect = blocked" in smoke
+    assert "FasterWhisperTranscriber" in smoke
+    assert "NllbCTranslate2Translator" in smoke
