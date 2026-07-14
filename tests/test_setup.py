@@ -18,11 +18,12 @@ def test_recommendation_selects_automatic_bundle_with_rationale():
     plan = RecommendationEngine().recommend(scanner.scan())
     assert plan.transcription_model == "whisper-large-v3"
     assert plan.translation_model == "nllb-200-distilled-600m"
-    assert plan.download_gb > 1
+    assert plan.download_gb == 3.8
     assert plan.reasons
 
 
 def test_low_memory_system_gets_smaller_transcription_model():
     scanner = SetupScanner(lambda: HardwareProfile(False, None, 0, 8), lambda: 20, lambda: True)
-    assert RecommendationEngine().recommend(scanner.scan()).transcription_model == "whisper-small"
-
+    plan = RecommendationEngine().recommend(scanner.scan())
+    assert plan.transcription_model == "whisper-small"
+    assert plan.download_gb == 1.2

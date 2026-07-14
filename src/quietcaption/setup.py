@@ -62,9 +62,9 @@ class RecommendationEngine:
         if scan.hardware.cuda_available and scan.hardware.vram_gb >= 8 and scan.hardware.ram_gb >= 16:
             transcription = "whisper-large-v3"
             reason = "Your NVIDIA GPU and memory can run the highest-quality multilingual transcription bundle."
-            size = 5.6
+            size = 3.8
         else:
             transcription = "whisper-small"
             reason = "A compact transcription model is recommended for reliable CPU and lower-memory operation."
-            size = 3.4
+            size = 1.2
         return SetupPlan(transcription, "nllb-200-distilled-600m", size, round(size * 1.15, 1), (reason, "NLLB-200 adds broad offline translation coverage."))
