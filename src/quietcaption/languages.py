@@ -64,6 +64,24 @@ def _name(alpha3: str) -> str:
     return language.name if language else alpha3.upper()
 
 
+NLLB_ALIASES = {
+    "ar":"arb_Arab","az":"azj_Latn","bn":"ben_Beng","bo":"bod_Tibt","cs":"ces_Latn","cy":"cym_Latn","de":"deu_Latn","el":"ell_Grek","en":"eng_Latn","es":"spa_Latn","eu":"eus_Latn","fa":"pes_Arab","fr":"fra_Latn","gu":"guj_Gujr","he":"heb_Hebr","hi":"hin_Deva","hy":"hye_Armn","ja":"jpn_Jpan","ka":"kat_Geor","km":"khm_Khmr","ko":"kor_Hang","lo":"lao_Laoo","mi":"mri_Latn","ms":"zsm_Latn","my":"mya_Mymr","ne":"npi_Deva","nl":"nld_Latn","no":"nob_Latn","pa":"pan_Guru","ps":"pbt_Arab","pt":"por_Latn","ro":"ron_Latn","si":"sin_Sinh","sk":"slk_Latn","sr":"srp_Cyrl","sw":"swh_Latn","tl":"tgl_Latn","ur":"urd_Arab","uz":"uzn_Latn","zh":"zho_Hans","yue":"yue_Hant"
+}
+
+
+def resolve_nllb_code(code: str) -> str:
+    if code in NLLB_CODES:
+        return code
+    if code in NLLB_ALIASES:
+        return NLLB_ALIASES[code]
+    language = pycountry.languages.get(alpha_2=code)
+    if language and hasattr(language, "alpha_3"):
+        match = next((item for item in NLLB_CODES if item.startswith(language.alpha_3 + "_")), None)
+        if match:
+            return match
+    raise ValueError(f"No NLLB-200 token is mapped for {code}")
+
+
 def default_registry() -> LanguageRegistry:
     records: dict[str, Language] = {}
     for code, name in WHISPER_LANGUAGES.items():
@@ -74,4 +92,3 @@ def default_registry() -> LanguageRegistry:
         if code == "arb_Arab": name = "Arabic"
         records[code] = Language(code, name, name, SCRIPT_NAMES.get(script, script), "rtl" if script in RTL_SCRIPTS else "ltr")
     return LanguageRegistry(list(records.values()))
-

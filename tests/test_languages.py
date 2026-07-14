@@ -1,4 +1,4 @@
-from quietcaption.languages import CapabilityTier, LanguageRegistry, default_registry
+from quietcaption.languages import CapabilityTier, LanguageRegistry, default_registry, resolve_nllb_code
 from quietcaption.models import built_in_catalog
 
 
@@ -28,3 +28,9 @@ def test_active_model_capabilities_drive_selector_options():
     options = registry.for_model(whisper)
     assert {item.code for item in options} == whisper.languages
 
+
+def test_whisper_codes_resolve_to_nllb_tokens():
+    assert resolve_nllb_code("en") == "eng_Latn"
+    assert resolve_nllb_code("ar") == "arb_Arab"
+    assert resolve_nllb_code("zh") == "zho_Hans"
+    assert resolve_nllb_code("spa_Latn") == "spa_Latn"

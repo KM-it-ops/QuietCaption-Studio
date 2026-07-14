@@ -11,6 +11,7 @@ from ..projects import ProjectStore
 from ..settings import AppSettings
 from ..settings import SettingsStore
 from ..transcription import FasterWhisperTranscriber
+from ..translation import NllbCTranslate2Translator
 from .editor import SubtitleEditor
 from .new_job import NewJobView
 from .models_view import ModelsView
@@ -82,8 +83,17 @@ class MainWindow(QMainWindow):
         if self.demo:
             pipeline = SubtitlePipeline(DemoMedia(), DemoTranscriber(), DemoTranslator())
         else:
-            model = {"Small — balanced": "small", "Medium — accurate": "medium", "Large v3 — highest accuracy": "large-v3"}[self.new_job.model.currentText()]
-            pipeline = SubtitlePipeline(FFmpegService(), FasterWhisperTranscriber(model, self.compute), None)
+            transcription_model = self.models_page.service.active("transcription")
+            if transcription_model is None:
+                self._failed("No transcription model is active. Open Models and complete Automated or Custom setup."); return
+            transcription_path = self.models_page.service.registry.root / transcription_model.id
+            translator = None
+            if targets:
+                translation_model = self.models_page.service.active("translation")
+                if translation_model is None:
+                    self._failed("No translation model is active. Install and activate one from Models."); return
+                translator = NllbCTranslate2Translator(self.models_page.service.registry.root / translation_model.id, self.compute.device)
+            pipeline = SubtitlePipeline(FFmpegService(), FasterWhisperTranscriber(str(transcription_path), self.compute), translator)
         request = PipelineRequest(files[0], output, targets, formats, self.new_job.source_language.code())
         worker = PipelineWorker(pipeline, request); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed)
         self._worker = worker; self.thread_pool.start(worker)

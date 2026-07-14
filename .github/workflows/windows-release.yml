@@ -32,9 +32,6 @@ jobs:
       - name: Build and test
         shell: powershell
         run: |
-          New-Item -ItemType Directory -Force .tmp-test | Out-Null
-          $env:TEMP = (Resolve-Path .tmp-test)
-          $env:TMP = $env:TEMP
           $env:QT_QPA_PLATFORM = "offscreen"
           powershell -ExecutionPolicy Bypass -File packaging\build.ps1
 
@@ -68,4 +65,3 @@ jobs:
             dist/QuietCaption-Studio-Setup-1.0.0.exe
             dist/QuietCaption-Studio-portable.zip
             dist/SHA256SUMS.txt
-

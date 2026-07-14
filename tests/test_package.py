@@ -18,7 +18,7 @@ def test_release_files_exist():
 def test_build_bootstraps_wheel_before_editable_install():
     script = Path("packaging/build.ps1").read_text(encoding="utf-8")
     bootstrap = 'pip install --upgrade pip setuptools wheel'
-    editable = 'pip install --no-build-isolation -e ".[dev]"'
+    editable = 'pip install --no-build-isolation -e ".[dev,inference]"'
     assert bootstrap in script
     assert script.index(bootstrap) < script.index(editable)
 
@@ -37,3 +37,24 @@ def test_build_finds_per_user_inno_setup_installation():
     script = Path("packaging/build.ps1").read_text(encoding="utf-8")
     assert "$env:LOCALAPPDATA" in script
     assert 'Programs\\Inno Setup 6\\ISCC.exe' in script
+
+
+def test_release_build_installs_native_offline_inference_runtime():
+    script = Path("packaging/build.ps1").read_text(encoding="utf-8")
+    assert '.[dev,inference]' in script
+    data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    inference = " ".join(data["project"]["optional-dependencies"]["inference"])
+    assert "faster-whisper" in inference
+    assert "ctranslate2" in inference
+    assert "sentencepiece" in inference
+    assert "torch" not in inference
+    assert "transformers" not in inference
+
+
+def test_release_build_uses_unique_workspace_pytest_directory():
+    script = Path("packaging/build.ps1").read_text(encoding="utf-8")
+    workflow = Path(".github/workflows/windows-release.yml").read_text(encoding="utf-8")
+    assert ".pytest-runs" in script
+    assert "--basetemp" in script
+    assert "-p no:cacheprovider" in script
+    assert ".tmp-test" not in workflow

@@ -7,8 +7,10 @@ if (-not (Test-Path ".venv\Scripts\python.exe")) {
 }
 
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
-& .\.venv\Scripts\python.exe -m pip install --no-build-isolation -e ".[dev]"
-& .\.venv\Scripts\python.exe -m pytest -q
+& .\.venv\Scripts\python.exe -m pip install --no-build-isolation -e ".[dev,inference]"
+$TestBase = ".pytest-runs\$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+New-Item -ItemType Directory -Path $TestBase -Force | Out-Null
+& .\.venv\Scripts\python.exe -m pytest -q --basetemp $TestBase -p no:cacheprovider
 if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
 & .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean packaging\quietcaption.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }

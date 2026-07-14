@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
+from .languages import resolve_nllb_code
+
 
 class Translator(Protocol):
     def translate(self, texts: list[str], source_language: str, target_language: str) -> list[str]: ...
@@ -37,3 +39,49 @@ class CTranslate2Translator:
         results = translator.translate_batch(batches, target_prefix=prefix)
         return [tokenizer.decode(item.hypotheses[0]) for item in results]
 
+
+class NllbCTranslate2Translator:
+    """Offline NLLB inference using an installed CTranslate2 snapshot."""
+
+    def __init__(self, model_path: Path, device: str = "cpu", engine=None, tokenizer=None):
+        self.model_path = Path(model_path)
+        self.device = "cuda" if device == "cuda" else "cpu"
+        self._engine = engine
+        self._tokenizer = tokenizer
+
+    def _load(self) -> None:
+        if self._engine is not None and self._tokenizer is not None:
+            return
+        try:
+            import ctranslate2
+            import sentencepiece as spm
+        except ImportError as exc:
+            raise RuntimeError("Install the inference extra to use NLLB offline translation") from exc
+        tokenizer_path = self.model_path / "sentencepiece.bpe.model"
+        if not tokenizer_path.is_file():
+            raise RuntimeError("The active translation model is missing sentencepiece.bpe.model; verify or repair it")
+        self._tokenizer = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
+        compute_type = "int8_float16" if self.device == "cuda" else "int8"
+        self._engine = ctranslate2.Translator(str(self.model_path), device=self.device, compute_type=compute_type)
+
+    def translate(self, texts: list[str], source_language: str, target_language: str) -> list[str]:
+        self._load()
+        source = resolve_nllb_code(source_language)
+        target = resolve_nllb_code(target_language)
+        batches = [[source, *self._tokenizer.encode(text, out_type=str), "</s>"] for text in texts]
+        results = self._engine.translate_batch(
+            batches,
+            target_prefix=[[target] for _ in batches],
+            batch_type="tokens",
+            max_batch_size=1024,
+            beam_size=4,
+        )
+        translated = []
+        for item in results:
+            tokens = list(item.hypotheses[0])
+            if tokens and tokens[0] == target:
+                tokens.pop(0)
+            if tokens and tokens[-1] == "</s>":
+                tokens.pop()
+            translated.append(self._tokenizer.decode(tokens))
+        return translated

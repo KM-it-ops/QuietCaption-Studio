@@ -11,6 +11,7 @@ class ModelDescriptor:
     url: str
     sha256: str
     license: str = "See model source"
+    revision: str = "main"
 
     def __post_init__(self):
         object.__setattr__(self, "languages", frozenset(self.languages))
@@ -30,6 +31,7 @@ class ModelRegistry:
 def built_in_catalog(registry=None) -> list[ModelDescriptor]:
     from .languages import NLLB_CODES, WHISPER_LANGUAGES
     return [
-        ModelDescriptor("whisper-large-v3", "transcription", frozenset(WHISPER_LANGUAGES), 3100, "https://huggingface.co/Systran/faster-whisper-large-v3", "0" * 64, "MIT / model terms"),
-        ModelDescriptor("nllb-200-distilled-600m", "translation", frozenset(NLLB_CODES), 2400, "https://huggingface.co/facebook/nllb-200-distilled-600M", "0" * 64, "CC-BY-NC-4.0"),
+        ModelDescriptor("whisper-small", "transcription", frozenset(WHISPER_LANGUAGES), 500, "Systran/faster-whisper-small", "0" * 64, "MIT / model terms", "536b0662742c02347bc0e980a01041f333bce120"),
+        ModelDescriptor("whisper-large-v3", "transcription", frozenset(WHISPER_LANGUAGES), 3100, "Systran/faster-whisper-large-v3", "0" * 64, "MIT / model terms", "edaa852ec7e145841d8ffdb056a99866b5f0a478"),
+        ModelDescriptor("nllb-200-distilled-600m", "translation", frozenset(NLLB_CODES), 651, "mijuanlo/nllb-200-distilled-600M-ct2-int8", "0" * 64, "CC-BY-NC-4.0 (non-commercial use)", "16bc5ff"),
     ]
