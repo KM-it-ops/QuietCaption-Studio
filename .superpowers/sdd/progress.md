@@ -28,4 +28,4 @@ Compute-device review corrections: implemented on 2026-07-14; re-review pending.
 - Focused verification: the compute/settings/translation/product-UI/control-contract set passed 60 tests in 5.35s with a fresh unique base.
 - Full regression verification: the full suite passed 177 tests in 11.25s with a fresh unique base.
 - Corrections: unavailable-CUDA preflight now applies only to production queues; demo still constructs its normal worker. `engine` and `tokenizer` retain their legacy positional slots, while `compute_type` is keyword-only and production passes it explicitly by keyword. Portable export/import and Processing reset now have direct fallback assertions.
-- Review status: re-review pending; no approval is claimed.
+- Re-review: approved at `96ec098` with no Critical, Important, or Minor findings. The reviewer confirmed demo behavior, legacy NLLB positional compatibility, explicit fallback transfer/reset coverage, and the new project-local learning rules.
