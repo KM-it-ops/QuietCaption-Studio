@@ -166,7 +166,7 @@ class SubtitleEditor(QWidget):
 
     def _report_session_warning(self) -> None:
         if self.session.last_warning:
-            title = "Recovery warning" if "stale recovery" in self.session.last_warning.lower() else "Save completed with warning"
+            title = "Recovery warning" if "recovery" in self.session.last_warning.lower() else "Save completed with warning"
             self._warning_handler(title, self.session.last_warning)
 
     def _autosave_recovery(self) -> None:

@@ -306,3 +306,17 @@ def test_editor_surfaces_stale_recovery_cleanup_warning_on_open(qtbot, tmp_path,
 
     assert warnings and warnings[0][0] == "Recovery warning"
     assert "locked stale recovery" in warnings[0][1]
+
+
+def test_editor_surfaces_corrupt_recovery_warning_without_blocking_open(qtbot, tmp_path):
+    session = session_at(tmp_path)
+    session.recovery_path.write_text("not json", encoding="utf-8")
+    opened = EditorSession.open(session.project_path, 0, list(session.export_paths.values()), lambda _: "recover")
+    warnings = []
+
+    editor = SubtitleEditor(opened, warning_handler=lambda title, message: warnings.append((title, message)))
+    qtbot.addWidget(editor)
+
+    assert opened.track.segments[0].text == "old"
+    assert warnings and warnings[0][0] == "Recovery warning"
+    assert "corrupt recovery" in warnings[0][1].lower()

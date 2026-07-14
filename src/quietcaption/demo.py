@@ -35,7 +35,9 @@ class DemoTranslator:
         "de": ["Willkommen bei QuietCaption Studio.", "Ihre Medien und Wörter bleiben auf diesem Computer."],
     }
 
-    def translate(self, texts, source_language, target_language):
+    def translate(self, texts, source_language, target_language, cancel=None):
+        if cancel and cancel.cancelled:
+            raise InterruptedError("Translation cancelled")
         target_language = {"spa_Latn": "es", "fra_Latn": "fr", "deu_Latn": "de"}.get(target_language, target_language)
         if target_language not in self.TRANSLATIONS:
             raise ValueError(f"The demo has no {target_language} translation model")

@@ -8,7 +8,7 @@ from quietcaption.models import built_in_catalog
 from quietcaption.models import ModelRegistry
 from quietcaption.pipeline import PipelineResult
 from quietcaption.settings import AppSettings, SettingsStore
-from quietcaption.ui.main_window import MainWindow
+from quietcaption.ui.main_window import CancellationToken, MainWindow, PipelineWorker
 from quietcaption.ui.models_view import ModelsView
 
 
@@ -194,3 +194,36 @@ def test_finish_queue_handles_skipped_pipeline_result(qtbot, tmp_path):
     assert window.pages.count() == original_page_count
     assert window.queue_status.text() == "Job skipped — existing output kept"
     assert window.statusBar().currentMessage() == "Skipped because output already exists"
+
+
+def test_pipeline_worker_uses_dedicated_cancelled_signal(qtbot):
+    class Pipeline:
+        def run(self, request, cancel=None):
+            raise InterruptedError("Job cancelled")
+
+    worker = PipelineWorker(Pipeline(), object(), CancellationToken())
+    cancelled = []
+    failed = []
+    worker.signals.cancelled.connect(cancelled.append)
+    worker.signals.failed.connect(failed.append)
+
+    worker.run()
+
+    assert cancelled == ["Job cancelled"]
+    assert failed == []
+
+
+def test_main_window_cancelled_state_is_non_error(qtbot, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    critical = []
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: critical.append(args))
+    window = MainWindow(demo=True)
+    qtbot.addWidget(window)
+    window._pending_files = []
+
+    window._cancelled("Job cancelled")
+
+    assert window.queue_status.text() == "Cancelled — no output was published"
+    assert window.statusBar().currentMessage() == "Cancelled"
+    assert critical == []

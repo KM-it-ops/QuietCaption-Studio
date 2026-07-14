@@ -70,6 +70,27 @@ def test_cleanup_failure_does_not_turn_committed_success_into_failure(tmp_path, 
     assert destination.read_text(encoding="utf-8") == "committed"
 
 
+def test_committed_publication_reports_exact_retained_backup_path(tmp_path, monkeypatch):
+    destination = tmp_path / "project.qcp"
+    destination.write_text("old user data", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def retain_backup(path, *args, **kwargs):
+        if path.suffix == ".bak":
+            raise PermissionError("backup is locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", retain_backup)
+
+    result = publish_text_batch({destination: "committed"})
+
+    assert destination.read_text(encoding="utf-8") == "committed"
+    assert len(result.retained_backups) == 1
+    retained = result.retained_backups[0]
+    assert retained.exists()
+    assert retained.read_text(encoding="utf-8") == "old user data"
+
+
 def test_cleanup_failure_does_not_mask_primary_staging_failure(tmp_path, monkeypatch):
     destination = tmp_path / "project.qcp"
     real_write = Path.write_text

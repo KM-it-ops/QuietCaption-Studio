@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -13,18 +14,36 @@ class RollbackFailure:
     error: Exception
 
 
+@dataclass(frozen=True)
+class PublicationResult:
+    retained_backups: tuple[Path, ...] = ()
+
+
+def _unlink_with_retries(path: Path, attempts: int = 3) -> Exception | None:
+    for attempt in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            return None
+        except OSError as exc:
+            if attempt == attempts - 1:
+                return exc
+            time.sleep(0.01)
+    return None
+
+
 def publish_text_batch(
     contents: dict[Path, str],
     temporary_paths: dict[Path, Path] | None = None,
     *,
     replace_existing: bool = True,
-) -> None:
+) -> PublicationResult:
     """Stage and publish a group of text files, rolling back partial publication."""
     staged: dict[Path, Path] = {}
     backups: dict[Path, Path] = {}
     published: list[Path] = []
     restored: set[Path] = set()
     rollback_failures: list[RollbackFailure] = []
+    retained_backups: list[Path] = []
     committed = False
     try:
         for destination, content in contents.items():
@@ -76,7 +95,7 @@ def publish_text_batch(
         for destination, backup in backups.items():
             if not committed and destination in published and destination not in restored:
                 continue
-            try:
-                backup.unlink(missing_ok=True)
-            except Exception:
-                pass
+            cleanup_error = _unlink_with_retries(backup)
+            if committed and cleanup_error is not None and backup.exists():
+                retained_backups.append(backup)
+    return PublicationResult(tuple(retained_backups))

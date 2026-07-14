@@ -27,6 +27,7 @@ from .theme import stylesheet_for
 class WorkerSignals(QObject):
     completed = Signal(object)
     failed = Signal(str)
+    cancelled = Signal(str)
 
 
 class PipelineWorker(QRunnable):
@@ -36,6 +37,7 @@ class PipelineWorker(QRunnable):
     @Slot()
     def run(self):
         try: self.signals.completed.emit(self.pipeline.run(self.request, cancel=self.cancel_token))
+        except InterruptedError as exc: self.signals.cancelled.emit(str(exc))
         except Exception as exc: self.signals.failed.emit(str(exc))
 
 
@@ -152,7 +154,7 @@ class MainWindow(QMainWindow):
             pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), self.compute), translator)
         request = PipelineRequest(source, output, targets, self._queue_formats, self._queue_source_language)
         self._cancel_token = CancellationToken()
-        worker = PipelineWorker(pipeline, request, self._cancel_token); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed)
+        worker = PipelineWorker(pipeline, request, self._cancel_token); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed); worker.signals.cancelled.connect(self._cancelled)
         self._worker = worker; self.thread_pool.start(worker)
 
     def _cancel_current_job(self):
@@ -192,6 +194,8 @@ class MainWindow(QMainWindow):
         self._editors.append(editor)
         self.pages.addWidget(editor); self.pages.setCurrentWidget(editor)
         self.statusBar().showMessage(f"Saved to {result.project_path.parent}")
+        if result.warnings:
+            QMessageBox.warning(self, "Completed with cleanup warning", "\n".join(result.warnings))
 
     def _recovery_choice(self, recovery_path: Path) -> str:
         choice = QMessageBox.question(
@@ -266,3 +270,12 @@ class MainWindow(QMainWindow):
         self._pending_files = []; self.queue_progress.hide(); self.cancel_button.setEnabled(False); self.queue_status.setText("Job failed — source media was not modified")
         self.new_job.generate.setEnabled(True)
         QMessageBox.critical(self, "QuietCaption could not finish", message)
+
+    @Slot(str)
+    def _cancelled(self, message):
+        self._pending_files = []
+        self.queue_progress.hide()
+        self.cancel_button.setEnabled(False)
+        self.new_job.generate.setEnabled(True)
+        self.queue_status.setText("Cancelled — no output was published")
+        self.statusBar().showMessage("Cancelled")

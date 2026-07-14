@@ -8,7 +8,7 @@ import pytest
 import quietcaption.atomic_files as atomic_module
 import quietcaption.editor_session as session_module
 from quietcaption.domain import Project, SubtitleSegment, SubtitleTrack
-from quietcaption.editor_session import EditorSession
+from quietcaption.editor_session import EditorSession, SaveConflictError
 from quietcaption.projects import ProjectStore
 
 
@@ -341,3 +341,38 @@ def test_successful_save_removes_recovery(tmp_path):
     session.save()
 
     assert not session.recovery_path.exists()
+
+
+@pytest.mark.parametrize("external_change", ["modified", "deleted"])
+def test_save_refuses_external_project_change_and_preserves_dirty_recovery(tmp_path, external_change):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "my unsaved edit")
+    if external_change == "modified":
+        session.project_path.write_text("external durable edit", encoding="utf-8")
+    else:
+        session.project_path.unlink()
+
+    with pytest.raises(SaveConflictError) as caught:
+        session.save()
+
+    assert caught.value.project_path == session.project_path
+    assert session.dirty
+    assert session.recovery_project().tracks[0].segments[0].text == "my unsaved edit"
+    if external_change == "modified":
+        assert session.project_path.read_text(encoding="utf-8") == "external durable edit"
+    else:
+        assert not session.project_path.exists()
+
+
+@pytest.mark.parametrize("recovery_content", ["{not json", '{"recovery_version": 1, "project": {}}'])
+def test_corrupt_recovery_does_not_block_valid_durable_project(tmp_path, recovery_content):
+    session = make_session(tmp_path, ("srt",))
+    session.recovery_path.write_text(recovery_content, encoding="utf-8")
+
+    opened = EditorSession.open(
+        session.project_path, 0, list(session.export_paths.values()), lambda _: pytest.fail("must not prompt")
+    )
+
+    assert opened.track.segments[0].text == "old"
+    assert opened.recovery_path.exists()
+    assert "corrupt recovery" in opened.last_warning.lower()

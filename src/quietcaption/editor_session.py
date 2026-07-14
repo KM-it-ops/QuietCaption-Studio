@@ -17,6 +17,12 @@ _WRITERS = {"srt": SrtWriter, "vtt": VttWriter, "txt": TextWriter}
 _RECOVERY_VERSION = 1
 
 
+class SaveConflictError(RuntimeError):
+    def __init__(self, project_path: Path):
+        self.project_path = Path(project_path)
+        super().__init__(f"Project changed outside QuietCaption: {self.project_path}")
+
+
 class EditorSession:
     def __init__(
         self,
@@ -56,13 +62,19 @@ class EditorSession:
         self.last_warning = None
         recovery_path = self.recovery_path
         try:
-            export_paths = self._publish_to(self.project_path, self.export_paths, replace_existing=True)
+            export_paths, retained = self._publish_to(
+                self.project_path,
+                self.export_paths,
+                replace_existing=True,
+                expected_fingerprint=self._base_fingerprint,
+            )
         except Exception as exc:
             self._recover_after_failure(exc)
             raise
         self.export_paths = export_paths
         self.dirty = False
         self._base_fingerprint = self._fingerprint(self.project_path)
+        self._warn_retained_backups(retained)
         self._remove_committed_recovery(recovery_path)
 
     def save_as(self, destination: Path) -> None:
@@ -76,7 +88,7 @@ class EditorSession:
         self.last_warning = None
         old_recovery = self.recovery_path
         try:
-            new_exports = self._publish_to(destination, new_exports, replace_existing=False)
+            new_exports, retained = self._publish_to(destination, new_exports, replace_existing=False)
         except Exception as exc:
             self._recover_after_failure(exc)
             raise
@@ -84,6 +96,7 @@ class EditorSession:
         self.export_paths = new_exports
         self.dirty = False
         self._base_fingerprint = self._fingerprint(self.project_path)
+        self._warn_retained_backups(retained)
         self._remove_committed_recovery(old_recovery)
 
     def _publish_to(
@@ -92,7 +105,8 @@ class EditorSession:
         export_paths: dict[str, Path],
         *,
         replace_existing: bool,
-    ) -> dict[str, Path]:
+        expected_fingerprint: str | None = None,
+    ) -> tuple[dict[str, Path], tuple[Path, ...]]:
         contents = {project_path: project_json(self.project)}
         effective_paths = dict(export_paths)
         for extension in self.selected_formats:
@@ -101,8 +115,15 @@ class EditorSession:
                 destination = project_path.parent / f"{project_path.stem}.{self.track.language}.{extension}"
             effective_paths[extension] = destination
             contents[destination] = _WRITERS[extension]().render(self.track)
-        publish_text_batch(contents, replace_existing=replace_existing)
-        return effective_paths
+        if expected_fingerprint is not None and self._current_fingerprint(project_path) != expected_fingerprint:
+            raise SaveConflictError(project_path)
+        publication = publish_text_batch(contents, replace_existing=replace_existing)
+        return effective_paths, publication.retained_backups
+
+    def _warn_retained_backups(self, retained: tuple[Path, ...]) -> None:
+        if retained:
+            paths = ", ".join(str(path) for path in retained)
+            self.last_warning = f"Save committed, but backup files containing prior user data were retained at: {paths}"
 
     def write_recovery(self) -> None:
         envelope = {
@@ -133,7 +154,8 @@ class EditorSession:
         try:
             recovery_path.unlink(missing_ok=True)
         except OSError as exc:
-            self.last_warning = f"Save committed, but the old recovery snapshot could not be removed: {exc}"
+            warning = f"Save committed, but the old recovery snapshot could not be removed: {exc}"
+            self.last_warning = f"{self.last_warning} {warning}" if self.last_warning else warning
 
     @classmethod
     def open(
@@ -148,7 +170,14 @@ class EditorSession:
         session = cls(durable, project_path, track_index, export_paths)
         if not session.recovery_path.exists():
             return session
-        recovered, base_fingerprint = session._read_recovery()
+        try:
+            recovered, base_fingerprint = session._read_recovery()
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            session.last_warning = (
+                f"Corrupt recovery snapshot was retained at {session.recovery_path}. "
+                f"The durable project was opened; move or delete the snapshot before retrying recovery. {exc}"
+            )
+            return session
         if base_fingerprint != session._base_fingerprint:
             try:
                 session.discard_recovery()
@@ -174,6 +203,13 @@ class EditorSession:
     @staticmethod
     def _fingerprint(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _current_fingerprint(path: Path) -> str | None:
+        try:
+            return EditorSession._fingerprint(path)
+        except FileNotFoundError:
+            return None
 
     def _paths_for_track(self, paths: Iterable[Path]) -> dict[str, Path]:
         selected = {}

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
+import json
 import os
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -28,6 +31,7 @@ class PipelineResult:
     project_path: Path | None
     exports: list[Path]
     skipped: bool = False
+    warnings: tuple[str, ...] = ()
 
 
 class CollisionError(RuntimeError):
@@ -38,25 +42,73 @@ class CollisionError(RuntimeError):
 
 
 class _NamespaceReservation:
+    _active_tokens: set[str] = set()
+
     def __init__(self, output_directory: Path, base_name: str):
         normalized_name = os.path.normcase(base_name)
         digest = hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()
         self.path = output_directory / f".quietcaption-reservation-{digest}.lock"
         self.acquired = False
+        self.token = uuid4().hex
 
     def acquire(self) -> bool:
-        try:
-            descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            return False
-        os.close(descriptor)
-        self.acquired = True
-        return True
+        for attempt in range(2):
+            try:
+                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if attempt == 0 and self._recover_orphaned_lock():
+                    continue
+                return False
+            try:
+                payload = json.dumps({"pid": os.getpid(), "token": self.token}).encode("utf-8")
+                os.write(descriptor, payload)
+            finally:
+                os.close(descriptor)
+            self.acquired = True
+            self._active_tokens.add(self.token)
+            return True
+        return False
 
-    def release(self) -> None:
+    def release(self) -> str | None:
         if self.acquired:
-            self.path.unlink(missing_ok=True)
+            error = self._unlink_with_retries()
+            self._active_tokens.discard(self.token)
             self.acquired = False
+            if error is not None:
+                return f"Output reservation cleanup failed at {self.path}: {error}"
+        return None
+
+    def _recover_orphaned_lock(self) -> bool:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            token = payload.get("token")
+            pid = int(payload.get("pid"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        if token in self._active_tokens:
+            return False
+        if pid != os.getpid() and self._pid_running(pid):
+            return False
+        return self._unlink_with_retries() is None
+
+    def _unlink_with_retries(self) -> OSError | None:
+        for attempt in range(3):
+            try:
+                self.path.unlink(missing_ok=True)
+                return None
+            except OSError as exc:
+                if attempt == 2:
+                    return exc
+                time.sleep(0.01)
+        return None
+
+    @staticmethod
+    def _pid_running(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
 
 
 @dataclass(frozen=True)
@@ -79,11 +131,17 @@ class SubtitlePipeline:
         if selection is None:
             return PipelineResult(None, [], skipped=True)
         workspace = request.output_directory / ".quietcaption" / uuid4().hex
+        result = None
+        primary = None
         try:
+            self._check_cancel(cancel)
             self.media.probe(request.source)
+            self._check_cancel(cancel)
             workspace.mkdir(parents=True, exist_ok=True)
             audio = self.media.extract_audio(request.source, workspace / "audio.wav", cancel)
+            self._check_cancel(cancel)
             language, segments = self.transcriber.transcribe(audio, request.source_language, progress, cancel)
+            self._check_cancel(cancel)
             source_track = SubtitleTrack(language, segments, "Source")
             tracks = [source_track]
             for target in request.target_languages:
@@ -91,7 +149,9 @@ class SubtitlePipeline:
                     continue
                 if self.translator is None:
                     raise ValueError(f"No offline translation model is configured for {language} → {target}")
-                texts = self.translator.translate([item.text for item in segments], language, target)
+                self._check_cancel(cancel)
+                texts = self._translate([item.text for item in segments], language, target, cancel)
+                self._check_cancel(cancel)
                 translated = [SubtitleSegment(item.id, item.start, item.end, text) for item, text in zip(segments, texts, strict=True)]
                 tracks.append(SubtitleTrack(target, translated, f"Translation ({target})"))
 
@@ -103,17 +163,60 @@ class SubtitlePipeline:
                 for extension in request.formats:
                     if extension not in writers:
                         continue
+                    self._check_cancel(cancel)
                     path = request.output_directory / f"{selection.base_name}.{track.language}.{extension}"
                     rendered_exports.append((path, writers[extension].render(track)))
+                    self._check_cancel(cancel)
 
             contents = {project_path: project_json(project)}
             contents.update(rendered_exports)
-            publish_text_batch(contents)
+            self._check_cancel(cancel)
+            try:
+                publication = publish_text_batch(
+                    contents,
+                    replace_existing=request.collision_policy == "replace",
+                )
+            except FileExistsError as exc:
+                conflicts = self._namespace_conflicts(request.output_directory, selection.base_name)
+                collision = CollisionError(conflicts or tuple(contents))
+                if hasattr(exc, "rollback_failures"):
+                    collision.rollback_failures = exc.rollback_failures
+                raise collision from exc
             exports = [path for path, _ in rendered_exports]
-            return PipelineResult(project_path, exports)
+            retained_warning = ()
+            if publication.retained_backups:
+                paths = ", ".join(str(path) for path in publication.retained_backups)
+                retained_warning = (f"Publication committed, but backup files containing user data were retained at: {paths}",)
+            result = PipelineResult(project_path, exports, warnings=retained_warning)
+        except Exception as exc:
+            primary = exc
         finally:
             shutil.rmtree(workspace, ignore_errors=True)
-            selection.reservation.release()
+        cleanup_warning = selection.reservation.release()
+        if primary is not None:
+            if cleanup_warning:
+                primary.cleanup_warning = OSError(cleanup_warning)
+                primary.add_note(cleanup_warning)
+            raise primary
+        if cleanup_warning:
+            result = PipelineResult(
+                result.project_path,
+                result.exports,
+                result.skipped,
+                (*result.warnings, cleanup_warning),
+            )
+        return result
+
+    def _translate(self, texts, source_language, target_language, cancel):
+        parameters = inspect.signature(self.translator.translate).parameters
+        if "cancel" in parameters:
+            return self.translator.translate(texts, source_language, target_language, cancel=cancel)
+        return self.translator.translate(texts, source_language, target_language)
+
+    @staticmethod
+    def _check_cancel(cancel) -> None:
+        if cancel is not None and cancel.cancelled:
+            raise InterruptedError("Job cancelled")
 
     def _select_namespace(self, request: PipelineRequest) -> _SelectedNamespace | None:
         base_name = request.source.stem

@@ -253,3 +253,97 @@ def test_invalid_collision_policy_is_rejected_before_processing(tmp_path):
         SubtitlePipeline(media, Transcriber()).run(request(source, tmp_path / "out", "rename"))
 
     assert media.calls == []
+
+
+@pytest.mark.parametrize("collision_kind", ["project", "export"])
+@pytest.mark.parametrize("policy", ["ask", "increment"])
+def test_late_collision_never_overwrites_external_output(tmp_path, monkeypatch, collision_kind, policy):
+    source = source_file(tmp_path)
+    output = tmp_path / "out"
+    real_publish = pipeline_module.publish_text_batch
+    raced = None
+
+    def race_then_publish(contents, *args, **kwargs):
+        nonlocal raced
+        raced = next(path for path in contents if (path.suffix == ".qcp") == (collision_kind == "project"))
+        raced.write_text("external racer", encoding="utf-8")
+        return real_publish(contents, *args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "publish_text_batch", race_then_publish)
+
+    with pytest.raises(pipeline_module.CollisionError) as caught:
+        SubtitlePipeline(RecordingMedia(), Transcriber()).run(request(source, output, policy))
+
+    assert raced in caught.value.conflicts
+    assert raced.read_text(encoding="utf-8") == "external racer"
+    assert not any(path.exists() for path in (output / "clip.qcp", output / "clip.en.srt") if path != raced)
+
+
+def test_cancellation_during_translation_publishes_nothing(tmp_path):
+    source = source_file(tmp_path)
+    output = tmp_path / "out"
+    cancel = type("Token", (), {"cancelled": False})()
+
+    class CancellingTranslator:
+        def translate(self, texts, source_language, target_language, cancel=None):
+            cancel.cancelled = True
+            return ["translated"]
+
+    req = PipelineRequest(source, output, ["es"], ["srt"], collision_policy="increment")
+    with pytest.raises(InterruptedError, match="cancelled"):
+        SubtitlePipeline(RecordingMedia(), Transcriber(), CancellingTranslator()).run(req, cancel=cancel)
+
+    assert not list(output.glob("*.qcp"))
+    assert not list(output.glob("*.srt"))
+
+
+def test_cancellation_immediately_before_publication_publishes_nothing(tmp_path, monkeypatch):
+    source = source_file(tmp_path)
+    output = tmp_path / "out"
+    cancel = type("Token", (), {"cancelled": False})()
+    real_render = pipeline_module.SrtWriter.render
+
+    def render_then_cancel(writer, track):
+        rendered = real_render(writer, track)
+        cancel.cancelled = True
+        return rendered
+
+    monkeypatch.setattr(pipeline_module.SrtWriter, "render", render_then_cancel)
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        SubtitlePipeline(RecordingMedia(), Transcriber()).run(request(source, output, "increment"), cancel=cancel)
+
+    assert not list(output.glob("*.qcp"))
+    assert not list(output.glob("*.srt"))
+
+
+@pytest.mark.parametrize("processing_succeeds", [False, True])
+def test_reservation_release_failure_is_non_masking_and_namespace_is_reusable(
+    tmp_path, monkeypatch, processing_succeeds
+):
+    source = source_file(tmp_path)
+    output = tmp_path / "out"
+    real_unlink = Path.unlink
+
+    def deny_lock_release(path, *args, **kwargs):
+        if path.name.startswith(".quietcaption-reservation-"):
+            raise PermissionError("sharing violation")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_lock_release)
+    pipeline = SubtitlePipeline(RecordingMedia(), Transcriber() if processing_succeeds else FailingTranscriber())
+    if processing_succeeds:
+        result = pipeline.run(request(source, output, "increment"))
+        assert result.project_path == output / "clip.qcp"
+        assert result.warnings and "reservation" in result.warnings[0].lower()
+    else:
+        with pytest.raises(RuntimeError, match="transcription failed") as caught:
+            pipeline.run(request(source, output, "increment"))
+        assert "sharing violation" in str(caught.value.cleanup_warning)
+
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    if processing_succeeds:
+        (output / "clip.qcp").unlink()
+        (output / "clip.en.srt").unlink()
+    reused = SubtitlePipeline(RecordingMedia(), Transcriber()).run(request(source, output, "increment"))
+    assert reused.project_path == output / "clip.qcp"
