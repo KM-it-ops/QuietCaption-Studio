@@ -17,6 +17,9 @@ class NewJobView(QWidget):
 
     def __init__(self, parent=None, use_catalog_defaults: bool = True):
         super().__init__(parent); self.files: list[Path] = []
+        self.runtime_ready = use_catalog_defaults
+        self.queue_running = False
+        self.runtime_reason = ""
         layout = QVBoxLayout(self); layout.setContentsMargins(28, 24, 28, 24); layout.setSpacing(14)
         heading = QLabel("Create subtitles"); heading.setStyleSheet("font-size: 26px; font-weight: 600")
         self.drop_zone = DropZone(); self.drop_zone.setMinimumHeight(150)
@@ -41,6 +44,20 @@ class NewJobView(QWidget):
         self.drop_zone.filesDropped.connect(self.add_files); self.drop_zone.browse.clicked.connect(self.browse)
         self.generate.clicked.connect(lambda: self.generateRequested.emit(self.files.copy()))
 
+    def _recompute_generate_enabled(self):
+        self.generate.setEnabled(bool(self.files) and self.runtime_ready and not self.queue_running)
+
+    def set_runtime_ready(self, ready: bool, reason: str = ""):
+        self.runtime_ready = ready
+        self.runtime_reason = "" if ready else reason
+        self.generate.setToolTip(self.runtime_reason)
+        self.generate.setAccessibleDescription(self.runtime_reason)
+        self._recompute_generate_enabled()
+
+    def set_queue_running(self, running: bool):
+        self.queue_running = running
+        self._recompute_generate_enabled()
+
     def set_active_models(self, transcription_model, translation_model):
         self.source_language.set_model(transcription_model) if hasattr(self, "source_language") else None
         self.target_language.set_model(translation_model) if hasattr(self, "target_language") else None
@@ -63,4 +80,4 @@ class NewJobView(QWidget):
             path = Path(path)
             if path.is_file() and path.suffix.lower() in MEDIA_SUFFIXES and path not in self.files:
                 self.files.append(path); self.file_list.addItem(f"{path.name}  ·  Ready")
-        self.file_list.setVisible(bool(self.files)); self.generate.setEnabled(bool(self.files))
+        self.file_list.setVisible(bool(self.files)); self._recompute_generate_enabled()

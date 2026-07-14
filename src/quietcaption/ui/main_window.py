@@ -1,15 +1,15 @@
 from pathlib import Path
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget
 
 from ..demo import DemoMedia, DemoTranscriber, DemoTranslator
 from ..editor_session import EditorSession
-from ..hardware import detect_hardware, resolve_compute
+from ..hardware import ComputeConfig, detect_hardware, resolve_compute
 from ..media import best_available_media_service
 from ..languages import default_registry
-from ..model_service import ModelService
+from ..model_service import ModelRuntime, ModelService, ModelUseLease
 from ..models import ModelRegistry, built_in_catalog
 from ..pipeline import PipelineRequest, SubtitlePipeline
 from ..projects import ProjectStore
@@ -46,6 +46,18 @@ class CancellationToken:
         self.cancelled = False
 
 
+@dataclass(frozen=True)
+class QueueRuntimeSnapshot:
+    output_directory: Path
+    target_language: str
+    source_language: str
+    formats: tuple[str, ...]
+    compute: ComputeConfig | None
+    transcription_options: TranscriptionOptions
+    model_runtimes: tuple[ModelRuntime, ...] = ()
+    lease: ModelUseLease | None = None
+
+
 class MainWindow(QMainWindow):
     def __init__(self, demo: bool = False, output_directory: Path | None = None, settings_store=None, model_service=None, hardware_probe=detect_hardware):
         super().__init__(); self.demo = demo; self.output_directory = output_directory; self.thread_pool = QThreadPool.globalInstance(); self.settings_store = settings_store or SettingsStore()
@@ -74,6 +86,7 @@ class MainWindow(QMainWindow):
         self.settings_page.modeChanged.connect(self.new_job.set_interface_mode)
         self.settings_page.settingsSaved.connect(self._apply_settings)
         self.models_page.modelActivated.connect(self._model_activated)
+        self.new_job.target_language.currentIndexChanged.connect(lambda _: self._sync_runtime_readiness())
         loaded_settings = initial_settings
         self.new_job.set_interface_mode(loaded_settings.interface_mode)
         self._apply_settings(loaded_settings)
@@ -108,6 +121,28 @@ class MainWindow(QMainWindow):
             self.models_page.service.active("transcription"),
             self.models_page.service.active("translation"),
         )
+        self._sync_runtime_readiness()
+
+    def _sync_runtime_readiness(self):
+        if self.demo:
+            self.new_job.set_runtime_ready(True)
+            return
+        kinds = ("transcription",)
+        if self.new_job.target_language.code() != "none":
+            kinds += ("translation",)
+        lease = None
+        try:
+            lease = self.models_page.service.acquire_runtime(kinds)
+        except Exception as exc:
+            reason = str(exc) or "Required local model is not ready. Open Models to install and activate it."
+            if "Models" not in reason:
+                reason = f"{reason} Open Models to install and activate the required local model."
+            self.new_job.set_runtime_ready(False, reason)
+        else:
+            self.new_job.set_runtime_ready(True)
+        finally:
+            if lease is not None:
+                lease.release()
 
     @staticmethod
     def _placeholder(title, text):
@@ -132,16 +167,43 @@ class MainWindow(QMainWindow):
             self.queue_status.setText(reason)
             self.statusBar().showMessage(reason)
             return
-        self._pending_files = list(files); self._completed_jobs = 0; self._last_result = None
-        self._queue_compute = self.compute_resolution.config
-        self._queue_target = self.new_job.target_language.code()
-        self._queue_formats = {"SRT": ["srt"], "VTT": ["vtt"], "SRT + VTT": ["srt", "vtt"], "SRT + VTT + TXT": ["srt", "vtt", "txt"]}[self.new_job.output_format.currentText()]
-        self._queue_source_language = self.new_job.source_language.code()
-        self._queue_transcription_options = TranscriptionOptions(
+        queue_compute = self.compute_resolution.config
+        queue_target = self.new_job.target_language.code()
+        queue_formats = {"SRT": ("srt",), "VTT": ("vtt",), "SRT + VTT": ("srt", "vtt"), "SRT + VTT + TXT": ("srt", "vtt", "txt")}[self.new_job.output_format.currentText()]
+        queue_source_language = self.new_job.source_language.code()
+        queue_transcription_options = TranscriptionOptions(
             beam_size=self.new_job.beam_size.value(),
         )
+        lease = None
+        try:
+            runtimes = ()
+            if not self.demo:
+                kinds = ("transcription",) + (("translation",) if queue_target != "none" else ())
+                lease = self.models_page.service.acquire_runtime(kinds)
+                runtimes = lease.runtimes
+            snapshot = QueueRuntimeSnapshot(
+                self.output_directory or Path(self.settings_store.load().output_directory),
+                queue_target,
+                queue_source_language,
+                queue_formats,
+                queue_compute,
+                queue_transcription_options,
+                runtimes,
+                lease,
+            )
+        except Exception:
+            if lease is not None:
+                lease.release()
+            return
+        self._queue_snapshot = snapshot
+        self._pending_files = list(files); self._completed_jobs = 0; self._last_result = None
+        self._queue_compute = queue_compute
+        self._queue_target = queue_target
+        self._queue_formats = queue_formats
+        self._queue_source_language = queue_source_language
+        self._queue_transcription_options = queue_transcription_options
         self.navigation.setCurrentRow(1); self.queue_progress.show()
-        self.new_job.generate.setEnabled(False)
+        self.new_job.set_queue_running(True)
         self.cancel_button.setEnabled(True)
         self._run_next_job()
 
@@ -149,32 +211,31 @@ class MainWindow(QMainWindow):
         if not self._pending_files:
             self._finish_queue()
             return
-        source = self._pending_files.pop(0)
-        self.queue_status.setText(f"Processing {source.name} locally…")
-        target = self._queue_target; targets = [] if target == "none" else [target]
-        output = self.output_directory or Path(self.settings_store.load().output_directory)
-        if self.demo:
-            pipeline = SubtitlePipeline(DemoMedia(), DemoTranscriber(), DemoTranslator())
-        else:
-            transcription_model = self.models_page.service.active("transcription")
-            if transcription_model is None:
-                self._failed("No transcription model is active. Open Models and complete Automated or Custom setup."); return
-            transcription_path = self.models_page.service.registry.root / transcription_model.id
-            translator = None
-            if targets:
-                translation_model = self.models_page.service.active("translation")
-                if translation_model is None:
-                    self._failed("No translation model is active. Install and activate one from Models."); return
-                translator = NllbCTranslate2Translator(
-                    self.models_page.service.registry.root / translation_model.id,
-                    self._queue_compute.device,
-                    compute_type=self._queue_compute.compute_type,
-                )
-            pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), self._queue_compute, self._queue_transcription_options), translator)
-        request = PipelineRequest(source, output, targets, self._queue_formats, self._queue_source_language)
-        self._cancel_token = CancellationToken()
-        worker = PipelineWorker(pipeline, request, self._cancel_token); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed); worker.signals.cancelled.connect(self._cancelled)
-        self._worker = worker; self.thread_pool.start(worker)
+        try:
+            source = self._pending_files.pop(0)
+            self.queue_status.setText(f"Processing {source.name} locally…")
+            snapshot = self._queue_snapshot
+            target = snapshot.target_language; targets = [] if target == "none" else [target]
+            output = snapshot.output_directory
+            if self.demo:
+                pipeline = SubtitlePipeline(DemoMedia(), DemoTranscriber(), DemoTranslator())
+            else:
+                runtime_by_kind = {runtime.descriptor.kind: runtime for runtime in snapshot.model_runtimes}
+                transcription_path = runtime_by_kind["transcription"].path
+                translator = None
+                if targets:
+                    translator = NllbCTranslate2Translator(
+                        runtime_by_kind["translation"].path,
+                        snapshot.compute.device,
+                        compute_type=snapshot.compute.compute_type,
+                    )
+                pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), snapshot.compute, snapshot.transcription_options), translator)
+            request = PipelineRequest(source, output, targets, list(snapshot.formats), snapshot.source_language)
+            self._cancel_token = CancellationToken()
+            worker = PipelineWorker(pipeline, request, self._cancel_token); worker.signals.completed.connect(self._completed); worker.signals.failed.connect(self._failed); worker.signals.cancelled.connect(self._cancelled)
+            self._worker = worker; self.thread_pool.start(worker)
+        except Exception as exc:
+            self._failed(str(exc))
 
     def _cancel_current_job(self):
         if getattr(self, "_cancel_token", None) is not None:
@@ -192,7 +253,8 @@ class MainWindow(QMainWindow):
             self._finish_queue()
 
     def _finish_queue(self):
-        self.queue_progress.hide(); self.cancel_button.setEnabled(False); self.new_job.generate.setEnabled(True)
+        self._release_queue_lease()
+        self.queue_progress.hide(); self.cancel_button.setEnabled(False); self.new_job.set_queue_running(False)
         count = getattr(self, "_completed_jobs", 0)
         self.queue_status.setText(f"{count} job{'s' if count != 1 else ''} completed")
         result = getattr(self, "_last_result", None)
@@ -286,15 +348,25 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _failed(self, message):
+        self._release_queue_lease()
         self._pending_files = []; self.queue_progress.hide(); self.cancel_button.setEnabled(False); self.queue_status.setText("Job failed — source media was not modified")
-        self.new_job.generate.setEnabled(True)
+        self.new_job.set_queue_running(False)
         QMessageBox.critical(self, "QuietCaption could not finish", message)
 
     @Slot(str)
     def _cancelled(self, message):
+        self._release_queue_lease()
         self._pending_files = []
         self.queue_progress.hide()
         self.cancel_button.setEnabled(False)
-        self.new_job.generate.setEnabled(True)
+        self.new_job.set_queue_running(False)
         self.queue_status.setText("Cancelled — no output was published")
         self.statusBar().showMessage("Cancelled")
+
+    def _release_queue_lease(self):
+        snapshot = getattr(self, "_queue_snapshot", None)
+        if snapshot is None or snapshot.lease is None:
+            return
+        lease = snapshot.lease
+        self._queue_snapshot = replace(snapshot, lease=None)
+        lease.release()

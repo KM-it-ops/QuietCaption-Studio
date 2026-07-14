@@ -4,9 +4,43 @@ import json
 import hashlib
 import os
 import shutil
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 from .models import ModelDescriptor, ModelRegistry
+
+
+@dataclass(frozen=True)
+class ModelRuntime:
+    descriptor: ModelDescriptor
+    path: Path
+
+
+class ModelUseLease:
+    def __init__(self, service: "ModelService", runtimes: tuple[ModelRuntime, ...]):
+        self._service = service
+        self.runtimes = runtimes
+        self._released = False
+
+    def release(self) -> None:
+        with self._service._lock:
+            if self._released:
+                return
+            for runtime in self.runtimes:
+                model_id = runtime.descriptor.id
+                remaining = self._service._use_counts[model_id] - 1
+                if remaining:
+                    self._service._use_counts[model_id] = remaining
+                else:
+                    del self._service._use_counts[model_id]
+            self._released = True
+
+    def __enter__(self) -> "ModelUseLease":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.release()
 
 
 def _sha256(path: Path) -> str:
@@ -29,8 +63,55 @@ class ModelService:
     def __init__(self, registry: ModelRegistry, fetcher=None):
         self.registry = registry
         self.fetcher = fetcher or _snapshot_fetcher
+        self._lock = threading.RLock()
+        self._use_counts: dict[str, int] = {}
+
+    def acquire_runtime(self, kinds: tuple[str, ...]) -> ModelUseLease:
+        with self._lock:
+            runtimes = []
+            for kind in kinds:
+                try:
+                    descriptor = self.active(kind)
+                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"Active {kind} model pointer is invalid") from exc
+                if descriptor is None:
+                    raise ValueError(f"No active {kind} model is ready")
+                if descriptor.kind != kind:
+                    raise ValueError(f"Active {kind} model pointer selects the wrong model kind")
+                path = self.registry.root / descriptor.id
+                if not self.registry.is_installed(descriptor.id):
+                    raise ValueError(f"Active {kind} model is not installed")
+                marker = path / ".complete"
+                try:
+                    marker_revision = marker.read_text(encoding="ascii")
+                except (OSError, UnicodeError) as exc:
+                    raise ValueError(f"Active {kind} model installation marker is invalid") from exc
+                if not path.is_dir() or not marker.is_file() or marker_revision != descriptor.revision:
+                    raise ValueError(f"Active {kind} model installation marker is invalid")
+                manifest = path / "manifest.json"
+                if not manifest.is_file():
+                    raise ValueError(f"Active {kind} model manifest is missing")
+                try:
+                    payload = json.loads(manifest.read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"Active {kind} model manifest is invalid") from exc
+                identity = (payload.get("id"), payload.get("kind"), payload.get("revision"), payload.get("repo_id"))
+                expected_identity = (descriptor.id, descriptor.kind, descriptor.revision, descriptor.url)
+                if identity != expected_identity or not self.verify(descriptor):
+                    raise ValueError(f"Active {kind} model manifest is invalid")
+                runtimes.append(ModelRuntime(descriptor, path))
+            result = tuple(runtimes)
+            for runtime in result:
+                model_id = runtime.descriptor.id
+                self._use_counts[model_id] = self._use_counts.get(model_id, 0) + 1
+            return ModelUseLease(self, result)
 
     def install(self, descriptor: ModelDescriptor) -> Path:
+        with self._lock:
+            self._assert_not_in_use(descriptor.id)
+            return self._install(descriptor)
+
+    def _install(self, descriptor: ModelDescriptor) -> Path:
         self.registry.root.mkdir(parents=True, exist_ok=True)
         destination = self.registry.root / descriptor.id
         staging = self.registry.root / f".{descriptor.id}.installing"
@@ -75,7 +156,15 @@ class ModelService:
         The source remains untouched until the complete destination copy has
         passed verification, so an interrupted or invalid move is recoverable.
         """
-        destination = Path(destination)
+        with self._lock:
+            installed_ids = tuple(
+                item.id for item in self.registry.catalog
+                if self.registry.is_installed(item.id)
+            )
+            self._assert_not_in_use(*installed_ids)
+            return self._move(Path(destination), verifier)
+
+    def _move(self, destination: Path, verifier=None) -> Path:
         source = self.registry.root
         if source.resolve() == destination.resolve():
             return destination
@@ -109,19 +198,21 @@ class ModelService:
         )
 
     def activate(self, descriptor: ModelDescriptor) -> ModelDescriptor:
-        if not self.registry.is_installed(descriptor.id):
-            raise ValueError("Model must be installed before activation")
-        active = self.registry.root / f"active-{descriptor.kind}.json"
-        temporary = active.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"id": descriptor.id}), encoding="utf-8")
-        os.replace(temporary, active)
-        return descriptor
+        with self._lock:
+            if not self.registry.is_installed(descriptor.id):
+                raise ValueError("Model must be installed before activation")
+            active = self.registry.root / f"active-{descriptor.kind}.json"
+            temporary = active.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"id": descriptor.id}), encoding="utf-8")
+            os.replace(temporary, active)
+            return descriptor
 
     def active(self, kind: str) -> ModelDescriptor | None:
-        path = self.registry.root / f"active-{kind}.json"
-        if not path.exists(): return None
-        model_id = json.loads(path.read_text(encoding="utf-8"))["id"]
-        return next((item for item in self.registry.catalog if item.id == model_id), None)
+        with self._lock:
+            path = self.registry.root / f"active-{kind}.json"
+            if not path.exists(): return None
+            model_id = json.loads(path.read_text(encoding="utf-8"))["id"]
+            return next((item for item in self.registry.catalog if item.id == model_id), None)
 
     def verify(self, descriptor: ModelDescriptor) -> bool:
         root = self.registry.root / descriptor.id
@@ -142,9 +233,16 @@ class ModelService:
             return False
 
     def remove(self, descriptor: ModelDescriptor, force: bool = False) -> None:
-        if self.active(descriptor.kind) == descriptor and not force:
-            raise ValueError("Cannot remove an active model without force")
-        root = self.registry.root / descriptor.id
-        if root.exists(): shutil.rmtree(root)
-        active = self.registry.root / f"active-{descriptor.kind}.json"
-        if force and self.active(descriptor.kind) == descriptor: active.unlink(missing_ok=True)
+        with self._lock:
+            self._assert_not_in_use(descriptor.id)
+            if self.active(descriptor.kind) == descriptor and not force:
+                raise ValueError("Cannot remove an active model without force")
+            root = self.registry.root / descriptor.id
+            if root.exists(): shutil.rmtree(root)
+            active = self.registry.root / f"active-{descriptor.kind}.json"
+            if force and self.active(descriptor.kind) == descriptor: active.unlink(missing_ok=True)
+
+    def _assert_not_in_use(self, *model_ids: str) -> None:
+        in_use = [model_id for model_id in model_ids if self._use_counts.get(model_id, 0)]
+        if in_use:
+            raise ValueError(f"Model is in use: {', '.join(in_use)}")

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from quietcaption.model_service import ModelService
+from quietcaption.model_service import ModelRuntime, ModelService
 from quietcaption.models import ModelDescriptor, ModelRegistry
 
 
@@ -141,3 +141,102 @@ def test_install_swap_failure_restores_previous_model(tmp_path, monkeypatch):
         service.install(descriptor)
 
     assert destination.joinpath("model.bin").read_bytes() == b"working-v1"
+
+
+def test_acquire_runtime_requires_a_complete_verified_active_installation(tmp_path):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    registry = ModelRegistry(tmp_path / "models", [descriptor])
+    service = ModelService(registry, fetcher=lambda *_: (_ for _ in ()).throw(AssertionError("fetch must not run")))
+
+    with pytest.raises(ValueError, match="active transcription model"):
+        service.acquire_runtime(("transcription",))
+
+    registry.root.mkdir(parents=True)
+    registry.root.joinpath("active-transcription.json").write_text('{"id":"demo"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="installed"):
+        service.acquire_runtime(("transcription",))
+
+    model_path = registry.root / descriptor.id
+    model_path.mkdir()
+    model_path.joinpath(".complete").write_text(descriptor.revision, encoding="ascii")
+    with pytest.raises(ValueError, match="manifest"):
+        service.acquire_runtime(("transcription",))
+
+    model_path.joinpath("manifest.json").write_text("not-json", encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest"):
+        service.acquire_runtime(("transcription",))
+
+    model_path.joinpath("model.bin").write_bytes(b"model")
+    model_path.joinpath("manifest.json").write_text(
+        '{"id":"demo","kind":"transcription","revision":"abc","repo_id":"owner/demo","files":{"model.bin":"9372c470eeadd5ecd9c3c74c2b3cb633f8e2f2fad799250a0f70d652b6b825e4"}}',
+        encoding="utf-8",
+    )
+    model_path.joinpath(".complete").write_text("wrong-revision", encoding="ascii")
+    with pytest.raises(ValueError, match="installation marker"):
+        service.acquire_runtime(("transcription",))
+    model_path.joinpath(".complete").write_text(descriptor.revision, encoding="ascii")
+
+    lease = service.acquire_runtime(("transcription",))
+
+    assert lease.runtimes == (ModelRuntime(descriptor, model_path),)
+    lease.release()
+
+
+def test_acquire_runtime_rejects_pointer_to_the_wrong_model_kind(tmp_path):
+    descriptor = ModelDescriptor("translator", "translation", {"en"}, 1, "owner/translator", "0" * 64, revision="abc")
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"model")
+
+    service = ModelService(ModelRegistry(tmp_path / "models", [descriptor]), fetcher=fetch)
+    service.install(descriptor)
+    service.registry.root.joinpath("active-transcription.json").write_text('{"id":"translator"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pointer"):
+        service.acquire_runtime(("transcription",))
+
+
+@pytest.mark.parametrize("operation", ["remove", "update", "repair", "move"])
+def test_model_mutations_are_blocked_by_live_runtime_lease(tmp_path, operation):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    fetches = []
+
+    def fetch(repo_id, revision, local_dir):
+        fetches.append((repo_id, revision))
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"model")
+
+    service = ModelService(ModelRegistry(tmp_path / "models", [descriptor]), fetcher=fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    fetches.clear()
+    lease = service.acquire_runtime(("transcription",))
+    destination = tmp_path / "moved-models"
+
+    def mutate():
+        if operation == "remove":
+            return service.remove(descriptor, force=True)
+        if operation == "update":
+            return service.update(descriptor)
+        if operation == "repair":
+            return service.repair(descriptor)
+        return service.move(destination)
+
+    with pytest.raises(ValueError, match="in use"):
+        mutate()
+
+    assert service.registry.root.joinpath(descriptor.id).is_dir()
+    assert not destination.exists()
+    assert fetches == []
+
+    lease.release()
+    lease.release()
+    mutate()
+
+    if operation == "remove":
+        assert not service.registry.root.joinpath(descriptor.id).exists()
+    elif operation == "move":
+        assert destination.joinpath(descriptor.id).is_dir()
+    else:
+        assert fetches == [("owner/demo", "abc")]

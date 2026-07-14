@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
@@ -8,6 +10,7 @@ from quietcaption.hardware import HardwareProfile
 from quietcaption.models import built_in_catalog
 from quietcaption.models import ModelRegistry
 from quietcaption.models import ModelDescriptor
+from quietcaption.model_service import ModelRuntime
 from quietcaption.pipeline import PipelineResult
 from quietcaption.settings import AppSettings, SettingsStore
 from quietcaption.ui.main_window import CancellationToken, MainWindow, PipelineWorker
@@ -88,6 +91,83 @@ def test_production_language_choices_follow_active_models(qtbot, tmp_path):
 
     assert window.new_job.source_language.count() >= 100
     assert window.new_job.target_language.count() >= 203
+
+
+def test_generate_tracks_local_model_readiness_without_readding_files(qtbot, tmp_path):
+    transcription = ModelDescriptor("whisper", "transcription", {"*"}, 1, "local", "0" * 64)
+    translation = ModelDescriptor("nllb", "translation", {"*"}, 1, "local", "1" * 64)
+
+    class Lease:
+        runtimes = ()
+        def release(self): pass
+
+    class Service:
+        def __init__(self):
+            self.registry = ModelRegistry(tmp_path / "models", [transcription, translation])
+            self.active_models = {}
+            self.ready_kinds = set()
+
+        def active(self, kind): return self.active_models.get(kind)
+        def acquire_runtime(self, kinds):
+            missing = next((kind for kind in kinds if kind not in self.ready_kinds), None)
+            if missing:
+                raise ValueError(f"No ready {missing} model. Open Models to install and activate one.")
+            return Lease()
+
+    service = Service()
+    window = MainWindow(demo=False, settings_store=SettingsStore(tmp_path / "settings.json"), model_service=service)
+    qtbot.addWidget(window)
+    media = tmp_path / "clip.wav"
+    media.write_bytes(b"audio")
+    window.new_job.add_files([media])
+
+    assert not window.new_job.generate.isEnabled()
+    assert "Models" in window.new_job.generate.toolTip()
+
+    service.active_models["transcription"] = transcription
+    service.ready_kinds.add("transcription")
+    window.models_page.modelActivated.emit(transcription)
+
+    assert window.new_job.generate.isEnabled()
+    assert window.new_job.files == [media]
+
+    service.active_models["translation"] = translation
+    window.models_page.modelActivated.emit(translation)
+    window.new_job.target_language.setCurrentIndex(1)
+
+    assert not window.new_job.generate.isEnabled()
+    assert "translation" in window.new_job.generate.toolTip().lower()
+
+
+def test_failed_runtime_acquisition_leaves_queue_and_ui_untouched(qtbot, tmp_path):
+    descriptor = ModelDescriptor("whisper", "transcription", {"*"}, 1, "local", "0" * 64)
+
+    class Service:
+        registry = ModelRegistry(tmp_path / "models", [descriptor])
+        def active(self, kind): return descriptor if kind == "transcription" else None
+        def acquire_runtime(self, kinds): raise ValueError("runtime unavailable")
+
+    window = MainWindow(demo=False, settings_store=SettingsStore(tmp_path / "settings.json"), model_service=Service())
+    qtbot.addWidget(window)
+    before = (
+        window.navigation.currentRow(),
+        window.queue_status.text(),
+        window.statusBar().currentMessage(),
+        window.queue_progress.isVisible(),
+        window.cancel_button.isEnabled(),
+    )
+
+    window._start_jobs([tmp_path / "clip.wav"])
+
+    assert (
+        window.navigation.currentRow(),
+        window.queue_status.text(),
+        window.statusBar().currentMessage(),
+        window.queue_progress.isVisible(),
+        window.cancel_button.isEnabled(),
+    ) == before
+    assert not hasattr(window, "_pending_files")
+    assert not hasattr(window, "_queue_snapshot")
 
 
 def test_incomplete_first_run_opens_hardware_setup(qtbot, tmp_path):
@@ -193,6 +273,13 @@ def _production_compute_window(qtbot, tmp_path, monkeypatch, settings, profile):
         def active(self, kind):
             return transcription_model if kind == "transcription" else translation_model
 
+        def acquire_runtime(self, kinds):
+            runtimes = tuple(
+                ModelRuntime(self.active(kind), self.registry.root / self.active(kind).id)
+                for kind in kinds
+            )
+            return type("Lease", (), {"runtimes": runtimes, "release": lambda self: None})()
+
     class RecordingThreadPool:
         def __init__(self):
             self.workers = []
@@ -281,8 +368,12 @@ def test_demo_queue_ignores_unavailable_cuda_preflight(qtbot, tmp_path):
     )
     qtbot.addWidget(window)
     window.thread_pool = RecordingThreadPool()
+    media = tmp_path / "demo.wav"
+    media.write_bytes(b"audio")
+    window.new_job.add_files([media])
 
-    window._start_jobs([tmp_path / "demo.wav"])
+    assert window.new_job.generate.isEnabled()
+    window._start_jobs(window.new_job.files)
 
     assert len(window.thread_pool.workers) == 1
     assert window._pending_files == []
@@ -412,6 +503,10 @@ def test_production_beam_size_is_snapshotted_for_each_queue(qtbot, tmp_path, mon
         def active(self, kind):
             return transcription_model if kind == "transcription" else None
 
+        def acquire_runtime(self, kinds):
+            runtimes = tuple(ModelRuntime(transcription_model, self.registry.root / transcription_model.id) for _ in kinds)
+            return type("Lease", (), {"runtimes": runtimes, "release": lambda self: None})()
+
     class RecordingThreadPool:
         def __init__(self):
             self.workers = []
@@ -447,3 +542,107 @@ def test_production_beam_size_is_snapshotted_for_each_queue(qtbot, tmp_path, mon
 
     assert received_options[2].beam_size == 3
     assert received_options[2] is not received_options[0]
+
+
+def test_production_queue_snapshots_model_paths_before_first_worker(qtbot, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: None)
+    transcription = ModelDescriptor("whisper", "transcription", {"*"}, 1, "local", "0" * 64)
+    translation = ModelDescriptor("nllb", "translation", {"*"}, 1, "local", "1" * 64)
+    original_root = tmp_path / "original-models"
+    changed_root = tmp_path / "changed-models"
+
+    class Lease:
+        def __init__(self, runtimes):
+            self.runtimes = runtimes
+            self.releases = 0
+
+        def release(self):
+            self.releases += 1
+
+    class Service:
+        def __init__(self):
+            self.registry = ModelRegistry(original_root, [transcription, translation])
+            self.active_models = {"transcription": transcription, "translation": translation}
+            self.lease = None
+
+        def active(self, kind):
+            return self.active_models.get(kind)
+
+        def acquire_runtime(self, kinds):
+            self.lease = Lease(tuple(ModelRuntime(self.active_models[kind], original_root / self.active_models[kind].id) for kind in kinds))
+            return self.lease
+
+    class RecordingThreadPool:
+        def __init__(self): self.workers = []
+        def start(self, worker): self.workers.append(worker)
+
+    received = {"transcription": [], "translation": []}
+    monkeypatch.setattr("quietcaption.ui.main_window.FasterWhisperTranscriber", lambda model, compute, options: received["transcription"].append(Path(model)) or object())
+    monkeypatch.setattr("quietcaption.ui.main_window.NllbCTranslate2Translator", lambda model, *args, **kwargs: received["translation"].append(Path(model)) or object())
+    service = Service()
+    window = MainWindow(
+        demo=False,
+        output_directory=tmp_path / "output",
+        settings_store=SettingsStore(tmp_path / "settings.json"),
+        model_service=service,
+    )
+    qtbot.addWidget(window)
+    window.thread_pool = RecordingThreadPool()
+    window.new_job.target_language.setCurrentIndex(1)
+
+    window._start_jobs([tmp_path / "first.wav", tmp_path / "second.wav"])
+    service.registry.root = changed_root
+    service.active_models.clear()
+    window._completed(object())
+
+    assert received == {
+        "transcription": [original_root / "whisper", original_root / "whisper"],
+        "translation": [original_root / "nllb", original_root / "nllb"],
+    }
+
+
+@pytest.mark.parametrize("exit_path", ["finish", "failed", "cancelled", "adapter_failure", "pool_failure"])
+def test_queue_releases_runtime_lease_once_on_every_exit(qtbot, tmp_path, monkeypatch, exit_path):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "critical", lambda *args: None)
+    descriptor = ModelDescriptor("whisper", "transcription", {"*"}, 1, "local", "0" * 64)
+
+    class Lease:
+        def __init__(self):
+            self.runtimes = (ModelRuntime(descriptor, tmp_path / "models" / descriptor.id),)
+            self.releases = 0
+        def release(self): self.releases += 1
+
+    class Service:
+        def __init__(self):
+            self.registry = ModelRegistry(tmp_path / "models", [descriptor])
+            self.leases = []
+        def active(self, kind): return descriptor if kind == "transcription" else None
+        def acquire_runtime(self, kinds):
+            lease = Lease(); self.leases.append(lease); return lease
+
+    class Pool:
+        def __init__(self): self.workers = []
+        def start(self, worker):
+            if exit_path == "pool_failure": raise RuntimeError("pool unavailable")
+            self.workers.append(worker)
+
+    if exit_path == "adapter_failure":
+        monkeypatch.setattr("quietcaption.ui.main_window.FasterWhisperTranscriber", lambda *args: (_ for _ in ()).throw(RuntimeError("adapter unavailable")))
+    else:
+        monkeypatch.setattr("quietcaption.ui.main_window.FasterWhisperTranscriber", lambda *args: object())
+    service = Service()
+    window = MainWindow(demo=False, output_directory=tmp_path / "output", settings_store=SettingsStore(tmp_path / "settings.json"), model_service=service)
+    qtbot.addWidget(window)
+    window.thread_pool = Pool()
+
+    window._start_jobs([tmp_path / "clip.wav"])
+    queue_lease = service.leases[-1]
+    if exit_path == "finish": window._finish_queue()
+    elif exit_path == "failed": window._failed("failed")
+    elif exit_path == "cancelled": window._cancelled("cancelled")
+
+    assert queue_lease.releases == 1

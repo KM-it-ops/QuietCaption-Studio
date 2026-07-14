@@ -78,6 +78,32 @@ def test_multiple_dropped_files_run_through_the_queue(qtbot, tmp_path):
     )
 
 
+def test_demo_queue_snapshots_output_directory_before_first_worker(qtbot, tmp_path):
+    class RecordingThreadPool:
+        def __init__(self):
+            self.workers = []
+
+        def start(self, worker):
+            self.workers.append(worker)
+
+    first_output = tmp_path / "first-output"
+    second_output = tmp_path / "second-output"
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(AppSettings(output_directory=str(first_output)))
+    window = MainWindow(demo=True, settings_store=store)
+    qtbot.addWidget(window)
+    window.thread_pool = RecordingThreadPool()
+
+    window._start_jobs([tmp_path / "first.wav", tmp_path / "second.wav"])
+    store.save(AppSettings(output_directory=str(second_output)))
+    window._completed(object())
+
+    assert [worker.request.output_directory for worker in window.thread_pool.workers] == [
+        first_output,
+        first_output,
+    ]
+
+
 def test_queue_cancel_control_marks_current_job_for_cancellation(qtbot):
     window = MainWindow(demo=True); qtbot.addWidget(window)
     window._cancel_token = type("Token", (), {"cancelled": False})()
