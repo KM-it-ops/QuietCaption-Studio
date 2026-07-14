@@ -322,6 +322,98 @@ def test_runtime_lease_counts_are_isolated_between_distinct_registry_roots(tmp_p
     assert not service_b.registry.root.joinpath(descriptor.id).exists()
 
 
+def test_runtime_acquisition_retries_on_destination_root_after_concurrent_move(tmp_path, monkeypatch):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"model")
+
+    source = tmp_path / "models"
+    destination = tmp_path / "moved-models"
+    moved_again = tmp_path / "moved-again"
+    service = ModelService(ModelRegistry(source, [descriptor]), fetcher=fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    verifier_entered = threading.Event()
+    allow_move = threading.Event()
+    acquisition_captured_state = threading.Event()
+    move_errors = []
+    acquisition_errors = []
+    acquired_leases = []
+
+    def blocking_verifier(staging):
+        assert staging.joinpath(descriptor.id, "model.bin").read_bytes() == b"model"
+        verifier_entered.set()
+        if not allow_move.wait(5):
+            raise TimeoutError("test did not release move verifier")
+        return True
+
+    real_state_for_root = service._state_for_root
+    acquisition_thread = None
+
+    def tracking_state_for_root(root):
+        state = real_state_for_root(root)
+        if threading.current_thread() is acquisition_thread:
+            acquisition_captured_state.set()
+        return state
+
+    monkeypatch.setattr(service, "_state_for_root", tracking_state_for_root)
+    move_thread = threading.Thread(
+        target=lambda: _capture_error(move_errors, lambda: service.move(destination, verifier=blocking_verifier))
+    )
+
+    def acquire():
+        try:
+            acquired_leases.append(service.acquire_runtime(("transcription",)))
+        except Exception as exc:
+            acquisition_errors.append(exc)
+
+    acquisition_thread = threading.Thread(target=acquire)
+    move_thread.start()
+    try:
+        assert verifier_entered.wait(5), "move did not reach verifier barrier"
+        acquisition_thread.start()
+        assert acquisition_captured_state.wait(5), "acquisition did not capture the old-root state"
+    finally:
+        allow_move.set()
+        move_thread.join(5)
+        acquisition_thread.join(5)
+
+    assert not move_thread.is_alive()
+    assert not acquisition_thread.is_alive()
+    assert move_errors == []
+    assert acquisition_errors == []
+    assert len(acquired_leases) == 1
+    lease = acquired_leases[0]
+    assert lease.runtimes == (ModelRuntime(descriptor, destination / descriptor.id),)
+    assert service.registry.root == destination
+    assert service.verify(descriptor)
+
+    contender_fetches = []
+
+    def contender_fetch(repo_id, revision, local_dir):
+        contender_fetches.append((repo_id, revision))
+        fetch(repo_id, revision, local_dir)
+
+    contender = ModelService(ModelRegistry(destination, [descriptor]), fetcher=contender_fetch)
+    before = (_tree_snapshot(destination), _tree_snapshot(moved_again))
+    blocked_operations = (
+        lambda: contender.remove(descriptor, force=True),
+        lambda: contender.update(descriptor),
+        lambda: contender.move(moved_again),
+    )
+    for mutate in blocked_operations:
+        with pytest.raises(ValueError, match="in use"):
+            mutate()
+        assert (_tree_snapshot(destination), _tree_snapshot(moved_again)) == before
+    assert contender_fetches == []
+
+    lease.release()
+    contender.update(descriptor)
+    assert contender_fetches == [("owner/demo", "abc")]
+
+
 def test_normalized_registry_use_state_is_collectible_after_service_release(tmp_path):
     import quietcaption.model_service as module
 

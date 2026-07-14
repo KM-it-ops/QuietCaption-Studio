@@ -174,6 +174,7 @@ class ModelService:
     def __init__(self, registry: ModelRegistry, fetcher=None):
         self.registry = registry
         self.fetcher = fetcher or _snapshot_fetcher
+        self._state_guard = threading.Lock()
         self._state_root = self.registry.root.resolve()
         self._use_state = _registry_use_state(self._state_root)
         self._cleanup_warnings: list[str] = []
@@ -198,10 +199,11 @@ class ModelService:
 
     def _state_for_root(self, root: Path) -> _RegistryUseState:
         normalized_root = Path(root).resolve()
-        if normalized_root != self._state_root:
-            self._state_root = normalized_root
-            self._use_state = _registry_use_state(normalized_root)
-        return self._use_state
+        with self._state_guard:
+            if normalized_root != self._state_root:
+                self._state_root = normalized_root
+                self._use_state = _registry_use_state(normalized_root)
+            return self._use_state
 
     def _journal(self, operation: str) -> _MutationJournal:
         return _MutationJournal(operation, self._record_cleanup_warning)
@@ -221,46 +223,49 @@ class ModelService:
             operation_lock.release()
 
     def acquire_runtime(self, kinds: tuple[str, ...]) -> ModelUseLease:
-        root = self.registry.root.resolve()
-        state = self._state_for_root(root)
-        with state.lock:
-            runtimes = []
-            for kind in kinds:
-                try:
-                    descriptor = self.active(kind)
-                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
-                    raise ValueError(f"Active {kind} model pointer is invalid") from exc
-                if descriptor is None:
-                    raise ValueError(f"No active {kind} model is ready")
-                if descriptor.kind != kind:
-                    raise ValueError(f"Active {kind} model pointer selects the wrong model kind")
-                path = root / descriptor.id
-                if not self.registry.is_installed(descriptor.id):
-                    raise ValueError(f"Active {kind} model is not installed")
-                marker = path / ".complete"
-                try:
-                    marker_revision = marker.read_text(encoding="ascii")
-                except (OSError, UnicodeError) as exc:
-                    raise ValueError(f"Active {kind} model installation marker is invalid") from exc
-                if not path.is_dir() or not marker.is_file() or marker_revision != descriptor.revision:
-                    raise ValueError(f"Active {kind} model installation marker is invalid")
-                manifest = path / "manifest.json"
-                if not manifest.is_file():
-                    raise ValueError(f"Active {kind} model manifest is missing")
-                try:
-                    payload = json.loads(manifest.read_text(encoding="utf-8"))
-                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                    raise ValueError(f"Active {kind} model manifest is invalid") from exc
-                identity = (payload.get("id"), payload.get("kind"), payload.get("revision"), payload.get("repo_id"))
-                expected_identity = (descriptor.id, descriptor.kind, descriptor.revision, descriptor.url)
-                if identity != expected_identity or not self.verify(descriptor):
-                    raise ValueError(f"Active {kind} model manifest is invalid")
-                runtimes.append(ModelRuntime(descriptor, path))
-            result = tuple(runtimes)
-            for runtime in result:
-                model_id = runtime.descriptor.id
-                state.counts[model_id] = state.counts.get(model_id, 0) + 1
-            return ModelUseLease(state, result)
+        while True:
+            root = self.registry.root.resolve()
+            state = self._state_for_root(root)
+            with state.lock:
+                if self.registry.root.resolve() != root:
+                    continue
+                runtimes = []
+                for kind in kinds:
+                    try:
+                        descriptor = self._active_at_root(kind, root)
+                    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                        raise ValueError(f"Active {kind} model pointer is invalid") from exc
+                    if descriptor is None:
+                        raise ValueError(f"No active {kind} model is ready")
+                    if descriptor.kind != kind:
+                        raise ValueError(f"Active {kind} model pointer selects the wrong model kind")
+                    path = root / descriptor.id
+                    if not self._is_installed_at_root(descriptor.id, root):
+                        raise ValueError(f"Active {kind} model is not installed")
+                    marker = path / ".complete"
+                    try:
+                        marker_revision = marker.read_text(encoding="ascii")
+                    except (OSError, UnicodeError) as exc:
+                        raise ValueError(f"Active {kind} model installation marker is invalid") from exc
+                    if not path.is_dir() or not marker.is_file() or marker_revision != descriptor.revision:
+                        raise ValueError(f"Active {kind} model installation marker is invalid")
+                    manifest = path / "manifest.json"
+                    if not manifest.is_file():
+                        raise ValueError(f"Active {kind} model manifest is missing")
+                    try:
+                        payload = json.loads(manifest.read_text(encoding="utf-8"))
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                        raise ValueError(f"Active {kind} model manifest is invalid") from exc
+                    identity = (payload.get("id"), payload.get("kind"), payload.get("revision"), payload.get("repo_id"))
+                    expected_identity = (descriptor.id, descriptor.kind, descriptor.revision, descriptor.url)
+                    if identity != expected_identity or not self._verify_at_root(descriptor, root):
+                        raise ValueError(f"Active {kind} model manifest is invalid")
+                    runtimes.append(ModelRuntime(descriptor, path))
+                result = tuple(runtimes)
+                for runtime in result:
+                    model_id = runtime.descriptor.id
+                    state.counts[model_id] = state.counts.get(model_id, 0) + 1
+                return ModelUseLease(state, result)
 
     def install(self, descriptor: ModelDescriptor) -> Path:
         with self.mutation("install"):
@@ -398,22 +403,37 @@ class ModelService:
         return descriptor
 
     def active(self, kind: str) -> ModelDescriptor | None:
-        with self._state_for_root(self.registry.root).lock:
-            return self._active_unlocked(kind)
+        while True:
+            root = self.registry.root.resolve()
+            state = self._state_for_root(root)
+            with state.lock:
+                if self.registry.root.resolve() != root:
+                    continue
+                return self._active_at_root(kind, root)
 
     def _active_unlocked(self, kind: str) -> ModelDescriptor | None:
-        path = self.registry.root / f"active-{kind}.json"
+        return self._active_at_root(kind, self.registry.root.resolve())
+
+    def _active_at_root(self, kind: str, root: Path) -> ModelDescriptor | None:
+        path = Path(root) / f"active-{kind}.json"
         if not path.exists(): return None
         model_id = json.loads(path.read_text(encoding="utf-8"))["id"]
         return next((item for item in self.registry.catalog if item.id == model_id), None)
 
     def verify(self, descriptor: ModelDescriptor) -> bool:
-        root = self.registry.root / descriptor.id
-        manifest = root / "manifest.json"
-        if not self.registry.is_installed(descriptor.id) or not manifest.exists():
+        return self._verify_at_root(descriptor, self.registry.root.resolve())
+
+    @staticmethod
+    def _is_installed_at_root(model_id: str, root: Path) -> bool:
+        return Path(root).joinpath(model_id, ".complete").exists()
+
+    def _verify_at_root(self, descriptor: ModelDescriptor, registry_root: Path) -> bool:
+        model_root = Path(registry_root) / descriptor.id
+        manifest = model_root / "manifest.json"
+        if not self._is_installed_at_root(descriptor.id, registry_root) or not manifest.exists():
             return False
         try:
-            resolved_root = root.resolve(strict=True)
+            resolved_root = model_root.resolve(strict=True)
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             if payload.get("revision") != descriptor.revision:
                 return False
