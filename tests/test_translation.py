@@ -80,3 +80,25 @@ def test_nllb_forwards_explicit_compute_type_to_ctranslate2(monkeypatch, tmp_pat
     translator._load()
 
     assert calls == [(str(tmp_path), {"device": "cuda", "compute_type": "float16"})]
+
+
+def test_nllb_preserves_legacy_three_positional_constructor(tmp_path):
+    engine = FakeEngine()
+
+    translator = NllbCTranslate2Translator(tmp_path, "cpu", engine)
+
+    assert translator._engine is engine
+    assert translator._tokenizer is None
+    assert translator.compute_type == "int8"
+
+
+def test_nllb_preserves_legacy_four_positional_constructor(tmp_path):
+    engine = FakeEngine()
+    tokenizer = FakeSentencePiece()
+
+    translator = NllbCTranslate2Translator(tmp_path, "cpu", engine, tokenizer)
+
+    assert translator.translate(["hello"], "en", "es") == ["hola"]
+    assert translator._engine is engine
+    assert translator._tokenizer is tokenizer
+    assert translator.compute_type == "int8"

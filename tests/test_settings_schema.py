@@ -34,6 +34,24 @@ def test_settings_reject_non_boolean_gpu_fallback(tmp_path):
         store.save(AppSettings(gpu_fallback="yes"))
 
 
+def test_gpu_fallback_survives_portable_transfer_and_processing_reset(tmp_path):
+    source = SettingsStore(tmp_path / "source.json")
+    destination = SettingsStore(tmp_path / "destination.json")
+    portable = tmp_path / "portable.json"
+    source.save(AppSettings(compute_device="cuda", gpu_fallback=False))
+
+    source.export_to(portable)
+    imported = destination.import_from(portable)
+
+    assert imported.compute_device == "cuda"
+    assert imported.gpu_fallback is False
+
+    reset = destination.reset_section("processing")
+
+    assert reset.compute_device == AppSettings().compute_device
+    assert reset.gpu_fallback is True
+
+
 def test_settings_reject_invalid_ranges_before_saving(tmp_path):
     store = SettingsStore(tmp_path / "settings.json")
 

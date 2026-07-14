@@ -18,5 +18,14 @@ Compute-device and GPU-fallback runtime wiring: complete on 2026-07-14.
 - GREEN: the same focused command with a fresh unique base passed 56 tests in 5.18s.
 - Regression: `python -m pytest -q --basetemp .pytest-runs/<unique> -p no:cacheprovider` with a fresh unique base passed 173 tests in 10.29s.
 - Static verification: `python -m compileall -q src` passed with a unique workspace-local `PYTHONPYCACHEPREFIX`; `git diff --check` passed.
-- Task review: approved. Startup and Save apply one injected hardware profile; unavailable explicit CUDA blocks before queue mutation; runnable queues snapshot one immutable compute config; Faster-Whisper and NLLB receive identical device and compute-type values. Demo pipeline construction, concurrency, language defaults, cache, appearance, updates, logging, lifecycle, and downloads remain unchanged.
-- Concerns: none. Runtime backend failures after a successfully detected CUDA profile remain surfaced normally and are intentionally outside this preflight policy task.
+- Initial task review: needs fixes. Review found that unavailable-CUDA preflight also blocked demo queues and that adding `compute_type` before legacy positional `engine`/`tokenizer` parameters broke existing constructor bindings. Portable GPU-fallback transfer/reset assertions were also requested. Corrections are in progress; re-review is pending.
+- Existing scope note: runtime backend failures after a successfully detected CUDA profile remain surfaced normally and are intentionally outside this preflight policy task.
+
+Compute-device review corrections: implemented on 2026-07-14; re-review pending.
+
+- Regression RED: the 5-test covering command for demo preflight, legacy three-/four-positional NLLB construction, explicit compute type, and portable fallback transfer/reset produced 3 expected failures and 2 passes. Demo created no worker, and both legacy positional forms bound to the wrong constructor fields.
+- Regression GREEN: the same 5-test command with a fresh unique base passed 5 tests in 0.89s.
+- Focused verification: the compute/settings/translation/product-UI/control-contract set passed 60 tests in 5.35s with a fresh unique base.
+- Full regression verification: the full suite passed 177 tests in 11.25s with a fresh unique base.
+- Corrections: unavailable-CUDA preflight now applies only to production queues; demo still constructs its normal worker. `engine` and `tokenizer` retain their legacy positional slots, while `compute_type` is keyword-only and production passes it explicitly by keyword. Portable export/import and Processing reset now have direct fallback assertions.
+- Review status: re-review pending; no approval is claimed.

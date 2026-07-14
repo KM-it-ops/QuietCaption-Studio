@@ -52,7 +52,7 @@ class CTranslate2Translator:
 class NllbCTranslate2Translator:
     """Offline NLLB inference using an installed CTranslate2 snapshot."""
 
-    def __init__(self, model_path: Path, device: str = "cpu", compute_type: str | None = None, engine=None, tokenizer=None):
+    def __init__(self, model_path: Path, device: str = "cpu", engine=None, tokenizer=None, *, compute_type: str | None = None):
         self.model_path = Path(model_path)
         self.device = "cuda" if device == "cuda" else "cpu"
         self.compute_type = compute_type or ("int8_float16" if self.device == "cuda" else "int8")

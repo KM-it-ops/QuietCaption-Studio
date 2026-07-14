@@ -127,7 +127,7 @@ class MainWindow(QMainWindow):
 
     def _start_jobs(self, files):
         if not files: return
-        if not self.compute_resolution.can_run:
+        if not self.demo and not self.compute_resolution.can_run:
             reason = self.compute_resolution.blocking_reason
             self.queue_status.setText(reason)
             self.statusBar().showMessage(reason)
@@ -168,7 +168,7 @@ class MainWindow(QMainWindow):
                 translator = NllbCTranslate2Translator(
                     self.models_page.service.registry.root / translation_model.id,
                     self._queue_compute.device,
-                    self._queue_compute.compute_type,
+                    compute_type=self._queue_compute.compute_type,
                 )
             pipeline = SubtitlePipeline(best_available_media_service(), FasterWhisperTranscriber(str(transcription_path), self._queue_compute, self._queue_transcription_options), translator)
         request = PipelineRequest(source, output, targets, self._queue_formats, self._queue_source_language)

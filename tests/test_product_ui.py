@@ -263,6 +263,32 @@ def test_unavailable_cuda_blocks_before_queue_mutation_or_worker_creation(qtbot,
     assert not hasattr(window, "_pending_files")
 
 
+def test_demo_queue_ignores_unavailable_cuda_preflight(qtbot, tmp_path):
+    class RecordingThreadPool:
+        def __init__(self):
+            self.workers = []
+
+        def start(self, worker):
+            self.workers.append(worker)
+
+    store = SettingsStore(tmp_path / "settings.json")
+    store.save(AppSettings(compute_device="cuda", gpu_fallback=False))
+    window = MainWindow(
+        demo=True,
+        output_directory=tmp_path / "output",
+        settings_store=store,
+        hardware_probe=lambda: HardwareProfile(False, None, 0, 16),
+    )
+    qtbot.addWidget(window)
+    window.thread_pool = RecordingThreadPool()
+
+    window._start_jobs([tmp_path / "demo.wav"])
+
+    assert len(window.thread_pool.workers) == 1
+    assert window._pending_files == []
+    assert window.queue_status.text() == "Processing demo.wav locally…"
+
+
 def test_cuda_save_applies_immediately_and_queue_snapshot_stays_stable(qtbot, tmp_path, monkeypatch):
     window, _, received = _production_compute_window(
         qtbot,
