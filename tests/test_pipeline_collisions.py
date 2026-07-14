@@ -1,4 +1,6 @@
 from pathlib import Path
+import os
+import time
 
 import pytest
 
@@ -347,3 +349,58 @@ def test_reservation_release_failure_is_non_masking_and_namespace_is_reusable(
         (output / "clip.en.srt").unlink()
     reused = SubtitlePipeline(RecordingMedia(), Transcriber()).run(request(source, output, "increment"))
     assert reused.project_path == output / "clip.qcp"
+
+
+def test_reservation_metadata_write_failure_cleans_partial_lock_without_masking(tmp_path, monkeypatch):
+    output = tmp_path / "out"
+    output.mkdir()
+    reservation = pipeline_module._NamespaceReservation(output, "clip")
+    primary = OSError("metadata write failed")
+    monkeypatch.setattr(pipeline_module.os, "write", lambda *_: (_ for _ in ()).throw(primary))
+
+    with pytest.raises(OSError, match="metadata write failed") as caught:
+        reservation.acquire()
+
+    assert caught.value is primary
+    assert not reservation.path.exists()
+
+
+def test_reservation_descriptor_close_failure_cleans_partial_lock(tmp_path, monkeypatch):
+    output = tmp_path / "out"
+    output.mkdir()
+    reservation = pipeline_module._NamespaceReservation(output, "clip")
+    real_close = pipeline_module.os.close
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        raise OSError("descriptor close failed")
+
+    monkeypatch.setattr(pipeline_module.os, "close", close_then_fail)
+
+    with pytest.raises(OSError, match="descriptor close failed"):
+        reservation.acquire()
+
+    assert not reservation.path.exists()
+
+
+def test_fresh_empty_reservation_is_not_reclaimed(tmp_path):
+    output = tmp_path / "out"
+    output.mkdir()
+    reservation = pipeline_module._NamespaceReservation(output, "clip")
+    reservation.path.write_bytes(b"")
+
+    assert not reservation.acquire()
+    assert reservation.path.exists()
+
+
+def test_stale_empty_reservation_is_reclaimed(tmp_path):
+    output = tmp_path / "out"
+    output.mkdir()
+    reservation = pipeline_module._NamespaceReservation(output, "clip")
+    reservation.path.write_bytes(b"")
+    stale = time.time() - pipeline_module._MALFORMED_LOCK_LEASE_SECONDS - 1
+    os.utime(reservation.path, (stale, stale))
+
+    assert reservation.acquire()
+    reservation.release()
+    assert not reservation.path.exists()

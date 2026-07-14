@@ -16,6 +16,9 @@ from .formats import SrtWriter, TextWriter, VttWriter
 from .projects import project_json
 
 
+_MALFORMED_LOCK_LEASE_SECONDS = 30.0
+
+
 @dataclass(frozen=True)
 class PipelineRequest:
     source: Path
@@ -59,11 +62,26 @@ class _NamespaceReservation:
                 if attempt == 0 and self._recover_orphaned_lock():
                     continue
                 return False
+            primary = None
             try:
                 payload = json.dumps({"pid": os.getpid(), "token": self.token}).encode("utf-8")
                 os.write(descriptor, payload)
-            finally:
+            except Exception as exc:
+                primary = exc
+            try:
                 os.close(descriptor)
+            except Exception as close_error:
+                if primary is None:
+                    primary = close_error
+                else:
+                    primary.close_error = close_error
+                    primary.add_note(f"Reservation descriptor close also failed: {close_error}")
+            if primary is not None:
+                cleanup_error = self._unlink_with_retries()
+                if cleanup_error is not None:
+                    primary.cleanup_error = cleanup_error
+                    primary.add_note(f"Partial reservation cleanup failed: {cleanup_error}")
+                raise primary
             self.acquired = True
             self._active_tokens.add(self.token)
             return True
@@ -83,11 +101,29 @@ class _NamespaceReservation:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             token = payload.get("token")
             pid = int(payload.get("pid"))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return self._recover_aged_malformed_lock()
+        except OSError:
             return False
         if token in self._active_tokens:
             return False
         if pid != os.getpid() and self._pid_running(pid):
+            return False
+        return self._unlink_with_retries() is None
+
+    def _recover_aged_malformed_lock(self) -> bool:
+        try:
+            observed = self.path.stat()
+        except OSError:
+            return False
+        if time.time() - observed.st_mtime < _MALFORMED_LOCK_LEASE_SECONDS:
+            return False
+        try:
+            current = self.path.stat()
+        except OSError:
+            return False
+        identity = (observed.st_ino, observed.st_size, observed.st_mtime_ns)
+        if identity != (current.st_ino, current.st_size, current.st_mtime_ns):
             return False
         return self._unlink_with_retries() is None
 

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import time
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterable
@@ -21,6 +24,37 @@ class SaveConflictError(RuntimeError):
     def __init__(self, project_path: Path):
         self.project_path = Path(project_path)
         super().__init__(f"Project changed outside QuietCaption: {self.project_path}")
+
+
+class _ProjectSaveLock:
+    def __init__(self, project_path: Path, timeout: float = 5.0):
+        self.path = project_path.with_name(f".{project_path.name}.save.lock")
+        self.timeout = timeout
+        self.acquired = False
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise SaveConflictError(self.path)
+                time.sleep(0.01)
+                continue
+            try:
+                os.write(descriptor, str(os.getpid()).encode("ascii"))
+            finally:
+                os.close(descriptor)
+            self.acquired = True
+            return self
+
+    def __exit__(self, *_):
+        if self.acquired:
+            try:
+                self.path.unlink(missing_ok=True)
+            finally:
+                self.acquired = False
 
 
 class EditorSession:
@@ -62,20 +96,21 @@ class EditorSession:
         self.last_warning = None
         recovery_path = self.recovery_path
         try:
-            export_paths, retained = self._publish_to(
-                self.project_path,
-                self.export_paths,
-                replace_existing=True,
-                expected_fingerprint=self._base_fingerprint,
-            )
+            with _ProjectSaveLock(self.project_path):
+                export_paths, retained = self._publish_to(
+                    self.project_path,
+                    self.export_paths,
+                    replace_existing=True,
+                    expected_fingerprint=self._base_fingerprint,
+                )
+                self.export_paths = export_paths
+                self.dirty = False
+                self._base_fingerprint = self._fingerprint(self.project_path)
+                self._warn_retained_backups(retained)
+                self._remove_committed_recovery(recovery_path)
         except Exception as exc:
             self._recover_after_failure(exc)
             raise
-        self.export_paths = export_paths
-        self.dirty = False
-        self._base_fingerprint = self._fingerprint(self.project_path)
-        self._warn_retained_backups(retained)
-        self._remove_committed_recovery(recovery_path)
 
     def save_as(self, destination: Path) -> None:
         destination = Path(destination)
@@ -115,9 +150,15 @@ class EditorSession:
                 destination = project_path.parent / f"{project_path.stem}.{self.track.language}.{extension}"
             effective_paths[extension] = destination
             contents[destination] = _WRITERS[extension]().render(self.track)
-        if expected_fingerprint is not None and self._current_fingerprint(project_path) != expected_fingerprint:
-            raise SaveConflictError(project_path)
-        publication = publish_text_batch(contents, replace_existing=replace_existing)
+        def verify_durable_project() -> None:
+            if expected_fingerprint is not None and self._current_fingerprint(project_path) != expected_fingerprint:
+                raise SaveConflictError(project_path)
+
+        publication = publish_text_batch(
+            contents,
+            replace_existing=replace_existing,
+            before_publish=verify_durable_project if expected_fingerprint is not None else None,
+        )
         return effective_paths, publication.retained_backups
 
     def _warn_retained_backups(self, retained: tuple[Path, ...]) -> None:
@@ -196,9 +237,30 @@ class EditorSession:
 
     def _read_recovery(self) -> tuple[Project, str | None]:
         data = json.loads(self.recovery_path.read_text(encoding="utf-8"))
+        if not isinstance(data, Mapping):
+            raise ValueError("Recovery snapshot must contain a JSON object")
         if data.get("recovery_version") == _RECOVERY_VERSION and "project" in data:
-            return Project.from_dict(data["project"]), data.get("base_fingerprint")
+            project_data = data["project"]
+            self._validate_project_shape(project_data)
+            return Project.from_dict(project_data), data.get("base_fingerprint")
+        self._validate_project_shape(data)
         return Project.from_dict(data), None
+
+    @staticmethod
+    def _validate_project_shape(data) -> None:
+        if not isinstance(data, Mapping):
+            raise ValueError("Recovery project must be a JSON object")
+        tracks = data.get("tracks")
+        if not isinstance(tracks, list):
+            raise ValueError("Recovery project tracks must be a JSON list")
+        for track in tracks:
+            if not isinstance(track, Mapping):
+                raise ValueError("Each recovery track must be a JSON object")
+            segments = track.get("segments")
+            if not isinstance(segments, list):
+                raise ValueError("Recovery track segments must be a JSON list")
+            if not all(isinstance(segment, Mapping) for segment in segments):
+                raise ValueError("Each recovery segment must be a JSON object")
 
     @staticmethod
     def _fingerprint(path: Path) -> str:

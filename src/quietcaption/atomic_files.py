@@ -5,6 +5,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 
@@ -36,6 +37,7 @@ def publish_text_batch(
     temporary_paths: dict[Path, Path] | None = None,
     *,
     replace_existing: bool = True,
+    before_publish: Callable[[], None] | None = None,
 ) -> PublicationResult:
     """Stage and publish a group of text files, rolling back partial publication."""
     staged: dict[Path, Path] = {}
@@ -54,6 +56,8 @@ def publish_text_batch(
             )
             staged[destination] = temporary
             temporary.write_text(content, encoding="utf-8")
+        if before_publish is not None:
+            before_publish()
         for destination in contents:
             if replace_existing and destination.exists():
                 backup = destination.with_name(f".{destination.name}.{uuid4().hex}.bak")

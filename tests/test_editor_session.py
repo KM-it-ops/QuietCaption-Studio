@@ -1,5 +1,7 @@
 import json
 import os
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -368,6 +370,98 @@ def test_save_refuses_external_project_change_and_preserves_dirty_recovery(tmp_p
 def test_corrupt_recovery_does_not_block_valid_durable_project(tmp_path, recovery_content):
     session = make_session(tmp_path, ("srt",))
     session.recovery_path.write_text(recovery_content, encoding="utf-8")
+
+    opened = EditorSession.open(
+        session.project_path, 0, list(session.export_paths.values()), lambda _: pytest.fail("must not prompt")
+    )
+
+    assert opened.track.segments[0].text == "old"
+    assert opened.recovery_path.exists()
+    assert "corrupt recovery" in opened.last_warning.lower()
+
+
+def test_save_detects_external_modification_during_staging(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "my staged edit")
+    real_write_text = Path.write_text
+    changed = False
+
+    def modify_durable_after_stage(path, content, *args, **kwargs):
+        nonlocal changed
+        result = real_write_text(path, content, *args, **kwargs)
+        if not changed and path.suffix == ".tmp" and '"my staged edit"' in content:
+            changed = True
+            real_write_text(session.project_path, "external during staging", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "write_text", modify_durable_after_stage)
+
+    with pytest.raises(SaveConflictError):
+        session.save()
+
+    assert session.project_path.read_text(encoding="utf-8") == "external during staging"
+    assert session.dirty
+    assert session.recovery_project().tracks[0].segments[0].text == "my staged edit"
+
+
+def test_two_sessions_serialize_save_and_second_conflicts(tmp_path, monkeypatch):
+    first = make_session(tmp_path, ("srt",))
+    second = EditorSession.open(first.project_path, 0, list(first.export_paths.values()), lambda _: "discard")
+    first.set_segment_text(0, "first session")
+    second.set_segment_text(0, "second session")
+    first_staged = threading.Event()
+    release_first = threading.Event()
+    real_write_text = Path.write_text
+    paused = False
+
+    def pause_first_save(path, content, *args, **kwargs):
+        nonlocal paused
+        result = real_write_text(path, content, *args, **kwargs)
+        if not paused and path.suffix == ".tmp" and '"first session"' in content:
+            paused = True
+            first_staged.set()
+            assert release_first.wait(2)
+        return result
+
+    monkeypatch.setattr(Path, "write_text", pause_first_save)
+    outcomes = {}
+
+    def save(name, session):
+        try:
+            session.save()
+            outcomes[name] = "saved"
+        except Exception as exc:
+            outcomes[name] = exc
+
+    first_thread = threading.Thread(target=save, args=("first", first))
+    second_thread = threading.Thread(target=save, args=("second", second))
+    first_thread.start()
+    assert first_staged.wait(2)
+    second_thread.start()
+    time.sleep(0.05)
+    assert second_thread.is_alive()
+    release_first.set()
+    first_thread.join(2)
+    second_thread.join(2)
+
+    assert outcomes["first"] == "saved"
+    assert isinstance(outcomes["second"], SaveConflictError)
+    assert ProjectStore(first.project_path).load().tracks[0].segments[0].text == "first session"
+    assert second.dirty
+    assert second.recovery_project().tracks[0].segments[0].text == "second session"
+
+
+@pytest.mark.parametrize(
+    "recovery_data",
+    [
+        [],
+        {"recovery_version": 1, "project": {"tracks": [[]]}},
+        {"recovery_version": 1, "project": {"tracks": [{"language": "en", "segments": {}}]}},
+    ],
+)
+def test_invalid_recovery_container_shapes_do_not_block_durable_project(tmp_path, recovery_data):
+    session = make_session(tmp_path, ("srt",))
+    session.recovery_path.write_text(json.dumps(recovery_data), encoding="utf-8")
 
     opened = EditorSession.open(
         session.project_path, 0, list(session.export_paths.values()), lambda _: pytest.fail("must not prompt")
