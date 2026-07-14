@@ -1,7 +1,7 @@
 import json
-import os
 from pathlib import Path
 
+from .atomic_files import publish_text_batch
 from .domain import Project
 
 
@@ -13,10 +13,11 @@ class ProjectStore:
         return Project.from_dict(json.loads(self.path.read_text(encoding="utf-8")))
 
     def save(self, project: Project) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        try:
-            temporary.write_text(json.dumps(project.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(temporary, self.path)
-        finally:
-            temporary.unlink(missing_ok=True)
+        publish_text_batch(
+            {self.path: project_json(project)},
+            {self.path: self.path.with_suffix(self.path.suffix + ".tmp")},
+        )
+
+
+def project_json(project: Project) -> str:
+    return json.dumps(project.to_dict(), ensure_ascii=False, indent=2)

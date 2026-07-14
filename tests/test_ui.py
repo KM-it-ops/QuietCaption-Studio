@@ -24,11 +24,17 @@ def test_add_files_accepts_media_and_rejects_other_types(qtbot, tmp_path):
     assert "clip.mp4" in window.new_job.file_list.item(0).text()
 
 
-def test_subtitle_editor_updates_text(qtbot):
-    from quietcaption.domain import SubtitleSegment, SubtitleTrack
+def test_subtitle_editor_updates_text(qtbot, tmp_path):
+    from quietcaption.domain import Project, SubtitleSegment, SubtitleTrack
+    from quietcaption.editor_session import EditorSession
+    from quietcaption.projects import ProjectStore
     from quietcaption.ui.editor import SubtitleEditor
     track = SubtitleTrack("en", [SubtitleSegment("a", 0, 1, "old")])
-    editor = SubtitleEditor(track); qtbot.addWidget(editor)
+    project = Project("id", "clip.mp4", [track])
+    project_path = tmp_path / "clip.qcp"
+    ProjectStore(project_path).save(project)
+    session = EditorSession(project, project_path, 0, [tmp_path / "clip.en.srt"])
+    editor = SubtitleEditor(session); qtbot.addWidget(editor)
     editor.table.item(0, 2).setText("new")
     assert editor.track.segments[0].text == "new"
 

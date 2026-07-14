@@ -5,6 +5,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal, Slot, Qt
 from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QStackedWidget, QVBoxLayout, QWidget
 
 from ..demo import DemoMedia, DemoTranscriber, DemoTranslator
+from ..editor_session import EditorSession
 from ..hardware import choose_compute, detect_hardware
 from ..media import best_available_media_service
 from ..languages import default_registry
@@ -46,6 +47,7 @@ class CancellationToken:
 class MainWindow(QMainWindow):
     def __init__(self, demo: bool = False, output_directory: Path | None = None, settings_store=None, model_service=None):
         super().__init__(); self.demo = demo; self.output_directory = output_directory; self.thread_pool = QThreadPool.globalInstance(); self.settings_store = settings_store or SettingsStore()
+        self._editors = []
         initial_settings = self.settings_store.load()
         if model_service is None:
             registry_data = default_registry()
@@ -180,9 +182,54 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Skipped because output already exists")
             return
         project = ProjectStore(result.project_path).load()
-        editor = SubtitleEditor(project.tracks[-1]); editor.setObjectName("editor")
+        session = EditorSession.open(
+            result.project_path,
+            len(project.tracks) - 1,
+            result.exports,
+            self._recovery_choice,
+        )
+        editor = SubtitleEditor(session); editor.setObjectName("editor")
+        self._editors.append(editor)
         self.pages.addWidget(editor); self.pages.setCurrentWidget(editor)
         self.statusBar().showMessage(f"Saved to {result.project_path.parent}")
+
+    def _recovery_choice(self, recovery_path: Path) -> str:
+        choice = QMessageBox.question(
+            self,
+            "Recover unsaved subtitle edits?",
+            f"A recovery snapshot exists beside this project:\n{recovery_path}\n\nRecover those edits? Choose No to discard it.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        return "recover" if choice == QMessageBox.Yes else "discard"
+
+    def _close_choice(self, editor: SubtitleEditor):
+        return QMessageBox.question(
+            self,
+            "Unsaved subtitle edits",
+            "Save subtitle edits before closing QuietCaption Studio?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+
+    def request_close(self) -> bool:
+        for editor in self._editors:
+            if not editor.is_dirty():
+                continue
+            choice = self._close_choice(editor)
+            if choice == QMessageBox.Cancel:
+                return False
+            if choice == QMessageBox.Save and not editor.save():
+                return False
+            if choice == QMessageBox.Discard:
+                editor.session.discard_recovery()
+        return True
+
+    def closeEvent(self, event):
+        if self.request_close():
+            event.accept()
+        else:
+            event.ignore()
 
     @Slot(str)
     def _failed(self, message):

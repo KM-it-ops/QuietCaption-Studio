@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from .atomic_files import publish_text_batch
 from .domain import Project, SubtitleSegment, SubtitleTrack
 from .formats import SrtWriter, TextWriter, VttWriter
-from .projects import ProjectStore
+from .projects import project_json
 
 
 @dataclass(frozen=True)
@@ -78,7 +79,6 @@ class SubtitlePipeline:
         if selection is None:
             return PipelineResult(None, [], skipped=True)
         workspace = request.output_directory / ".quietcaption" / uuid4().hex
-        staged_exports: list[Path] = []
         try:
             self.media.probe(request.source)
             workspace.mkdir(parents=True, exist_ok=True)
@@ -106,19 +106,12 @@ class SubtitlePipeline:
                     path = request.output_directory / f"{selection.base_name}.{track.language}.{extension}"
                     rendered_exports.append((path, writers[extension].render(track)))
 
-            for path, content in rendered_exports:
-                temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
-                staged_exports.append(temporary)
-                temporary.write_text(content, encoding="utf-8")
-            ProjectStore(project_path).save(project)
-            exports = []
-            for temporary, (path, _) in zip(staged_exports, rendered_exports, strict=True):
-                os.replace(temporary, path)
-                exports.append(path)
+            contents = {project_path: project_json(project)}
+            contents.update(rendered_exports)
+            publish_text_batch(contents)
+            exports = [path for path, _ in rendered_exports]
             return PipelineResult(project_path, exports)
         finally:
-            for temporary in staged_exports:
-                temporary.unlink(missing_ok=True)
             shutil.rmtree(workspace, ignore_errors=True)
             selection.reservation.release()
 
