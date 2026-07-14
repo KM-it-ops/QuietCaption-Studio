@@ -2,8 +2,15 @@ from __future__ import annotations
 
 import os
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
+
+
+@dataclass(frozen=True)
+class RollbackFailure:
+    path: Path
+    error: Exception
 
 
 def publish_text_batch(
@@ -17,6 +24,7 @@ def publish_text_batch(
     backups: dict[Path, Path] = {}
     published: list[Path] = []
     restored: set[Path] = set()
+    rollback_failures: list[RollbackFailure] = []
     committed = False
     try:
         for destination, content in contents.items():
@@ -39,20 +47,25 @@ def publish_text_batch(
                 os.link(temporary, destination)
             published.append(destination)
         committed = True
-    except Exception:
+    except Exception as primary:
         for destination in reversed(published):
             backup = backups.get(destination)
             if backup is None:
                 try:
                     destination.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except Exception as error:
+                    rollback_failures.append(RollbackFailure(destination, error))
             else:
                 try:
                     os.replace(backup, destination)
-                except Exception:
+                except Exception as error:
+                    rollback_failures.append(RollbackFailure(destination, error))
                     continue
                 restored.add(destination)
+        if rollback_failures:
+            primary.rollback_failures = tuple(rollback_failures)
+            detail = "; ".join(f"{failure.path}: {failure.error}" for failure in rollback_failures)
+            primary.add_note(f"Rollback incomplete; manual cleanup may be required: {detail}")
         raise
     finally:
         for temporary in staged.values():

@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -63,7 +64,7 @@ def test_save_as_refuses_to_replace_an_existing_project(tmp_path):
     assert destination.read_text(encoding="utf-8") == "keep me"
     assert session.project_path == tmp_path / "clip.qcp"
     assert session.dirty
-    assert ProjectStore(session.recovery_path).load().tracks[0].segments[0].text == "edited"
+    assert session.recovery_project().tracks[0].segments[0].text == "edited"
 
 
 def test_save_as_refuses_existing_selected_export_and_writes_recovery(tmp_path):
@@ -78,7 +79,7 @@ def test_save_as_refuses_existing_selected_export_and_writes_recovery(tmp_path):
 
     assert not destination.exists()
     assert export.read_text(encoding="utf-8") == "keep export"
-    assert ProjectStore(session.recovery_path).load().tracks[0].segments[0].text == "collision edit"
+    assert session.recovery_project().tracks[0].segments[0].text == "collision edit"
 
 
 def test_save_as_race_at_project_publication_never_overwrites_and_recovers(tmp_path, monkeypatch):
@@ -100,7 +101,29 @@ def test_save_as_race_at_project_publication_never_overwrites_and_recovers(tmp_p
 
     assert destination.read_text(encoding="utf-8") == "racer"
     assert session.project_path == tmp_path / "clip.qcp"
-    assert ProjectStore(session.recovery_path).load().tracks[0].segments[0].text == "racing edit"
+    assert session.recovery_project().tracks[0].segments[0].text == "racing edit"
+
+
+def test_save_as_collision_reports_unresolved_partial_and_writes_recovery(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "recover partial")
+    destination = tmp_path / "partial.qcp"
+    export = tmp_path / "partial.en.srt"
+    export.write_text("collision", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def deny_project_rollback(path, *args, **kwargs):
+        if path == destination:
+            raise PermissionError("project is locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_project_rollback)
+
+    with pytest.raises(FileExistsError) as caught:
+        session.save_as(destination)
+
+    assert [failure.path for failure in caught.value.rollback_failures] == [destination]
+    assert session.recovery_project().tracks[0].segments[0].text == "recover partial"
 
 
 def test_failed_save_preserves_all_originals_and_writes_recovery(tmp_path, monkeypatch):
@@ -124,7 +147,7 @@ def test_failed_save_preserves_all_originals_and_writes_recovery(tmp_path, monke
     assert session.project_path.read_text(encoding="utf-8") == original_project
     assert session.export_paths["srt"].read_text(encoding="utf-8") == original_srt
     assert session.export_paths["vtt"].read_text(encoding="utf-8") == original_vtt
-    assert ProjectStore(session.recovery_path).load().tracks[0].segments[0].text == "recoverable edit"
+    assert session.recovery_project().tracks[0].segments[0].text == "recoverable edit"
     assert session.dirty
 
 
@@ -140,7 +163,7 @@ def test_render_failure_keeps_originals_and_writes_recovery(tmp_path, monkeypatc
 
     assert session.project_path.read_text(encoding="utf-8") == original_project
     assert session.export_paths["srt"].read_text(encoding="utf-8") == original_export
-    assert ProjectStore(session.recovery_path).load().tracks[0].segments[0].text == "recover after render failure"
+    assert session.recovery_project().tracks[0].segments[0].text == "recover after render failure"
 
 
 def test_recovery_can_be_loaded_dirty_or_discarded(tmp_path):
@@ -236,6 +259,62 @@ def test_save_as_updates_path_after_commit_when_old_recovery_cannot_be_removed(t
     assert not session.dirty
     assert ProjectStore(destination).load().tracks[0].segments[0].text == "committed save as"
     assert "Windows file lock" in session.last_warning
+
+
+def test_recovery_base_fingerprint_prevents_edit_a_after_newer_edit_b_commit(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "edit A")
+    session.write_recovery()
+    recovery_path = session.recovery_path
+    envelope = json.loads(recovery_path.read_text(encoding="utf-8"))
+    assert envelope["base_fingerprint"]
+    assert envelope["project"]["tracks"][0]["segments"][0]["text"] == "edit A"
+
+    session.set_segment_text(0, "edit B")
+    real_unlink = Path.unlink
+
+    def deny_recovery_cleanup(path, *args, **kwargs):
+        if path == recovery_path:
+            raise PermissionError("recovery is locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_recovery_cleanup)
+    session.save()
+    decisions = []
+
+    reopened = EditorSession.open(
+        session.project_path,
+        0,
+        list(session.export_paths.values()),
+        lambda _: decisions.append(True) or "recover",
+    )
+
+    assert decisions == []
+    assert reopened.track.segments[0].text == "edit B"
+    assert "stale recovery" in reopened.last_warning.lower()
+
+
+def test_stale_recovery_cleanup_failure_loads_durable_with_warning(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "old recovery")
+    session.write_recovery()
+    durable = ProjectStore(session.project_path).load()
+    newer_track = replace(durable.tracks[0], segments=[replace(durable.tracks[0].segments[0], text="new durable")])
+    ProjectStore(session.project_path).save(replace(durable, tracks=[newer_track]))
+    recovery_path = session.recovery_path
+    real_unlink = Path.unlink
+
+    def deny_stale_cleanup(path, *args, **kwargs):
+        if path == recovery_path:
+            raise PermissionError("stale snapshot is locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_stale_cleanup)
+
+    opened = EditorSession.open(session.project_path, 0, list(session.export_paths.values()), lambda _: pytest.fail("must not prompt"))
+
+    assert opened.track.segments[0].text == "new durable"
+    assert "stale snapshot is locked" in opened.last_warning
 
 
 def test_primary_save_error_survives_recovery_write_failure(tmp_path, monkeypatch):

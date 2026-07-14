@@ -89,6 +89,7 @@ class SubtitleEditor(QWidget):
         self._recovery_timer.setInterval(500)
         self._recovery_timer.timeout.connect(self._autosave_recovery)
         self._update_dirty_status()
+        self._report_session_warning()
 
     @property
     def track(self):
@@ -126,7 +127,7 @@ class SubtitleEditor(QWidget):
             return False
         self._recovery_timer.stop()
         self._update_dirty_status()
-        self._report_committed_warning()
+        self._report_session_warning()
         return True
 
     def save_as(self) -> bool:
@@ -141,7 +142,7 @@ class SubtitleEditor(QWidget):
             return False
         self._recovery_timer.stop()
         self._update_dirty_status()
-        self._report_committed_warning()
+        self._report_session_warning()
         return True
 
     def stop_recovery_timer(self) -> None:
@@ -157,11 +158,16 @@ class SubtitleEditor(QWidget):
             detail = f"Your edits were written to the local recovery snapshot. {exc}"
         else:
             detail = f"{exc}. Recovery could not be written: {recovery_error}. Keep this editor open."
+        rollback_failures = getattr(exc, "rollback_failures", ())
+        if rollback_failures:
+            paths = ", ".join(str(failure.path) for failure in rollback_failures)
+            detail += f" Incomplete rollback left local files at: {paths}. Move or remove them before retrying."
         self._error_handler(title, detail)
 
-    def _report_committed_warning(self) -> None:
+    def _report_session_warning(self) -> None:
         if self.session.last_warning:
-            self._warning_handler("Save completed with warning", self.session.last_warning)
+            title = "Recovery warning" if "stale recovery" in self.session.last_warning.lower() else "Save completed with warning"
+            self._warning_handler(title, self.session.last_warning)
 
     def _autosave_recovery(self) -> None:
         if not self.session.dirty:

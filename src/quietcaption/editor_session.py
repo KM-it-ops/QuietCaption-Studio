@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import os
+import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable, Iterable
@@ -13,6 +14,7 @@ from .projects import ProjectStore, project_json
 
 SUPPORTED_FORMATS = ("srt", "vtt", "txt")
 _WRITERS = {"srt": SrtWriter, "vtt": VttWriter, "txt": TextWriter}
+_RECOVERY_VERSION = 1
 
 
 class EditorSession:
@@ -30,6 +32,7 @@ class EditorSession:
         self.selected_formats = set(self.export_paths)
         self.dirty = False
         self.last_warning: str | None = None
+        self._base_fingerprint = self._fingerprint(self.project_path)
 
     @property
     def track(self) -> SubtitleTrack:
@@ -59,7 +62,8 @@ class EditorSession:
             raise
         self.export_paths = export_paths
         self.dirty = False
-        self._remove_committed_recovery(recovery_path, self.project_path)
+        self._base_fingerprint = self._fingerprint(self.project_path)
+        self._remove_committed_recovery(recovery_path)
 
     def save_as(self, destination: Path) -> None:
         destination = Path(destination)
@@ -70,7 +74,6 @@ class EditorSession:
             for extension in self.selected_formats
         }
         self.last_warning = None
-        old_project_path = self.project_path
         old_recovery = self.recovery_path
         try:
             new_exports = self._publish_to(destination, new_exports, replace_existing=False)
@@ -80,7 +83,8 @@ class EditorSession:
         self.project_path = destination
         self.export_paths = new_exports
         self.dirty = False
-        self._remove_committed_recovery(old_recovery, old_project_path)
+        self._base_fingerprint = self._fingerprint(self.project_path)
+        self._remove_committed_recovery(old_recovery)
 
     def _publish_to(
         self,
@@ -101,13 +105,19 @@ class EditorSession:
         return effective_paths
 
     def write_recovery(self) -> None:
-        ProjectStore(self.recovery_path).save(self.project)
-        if self.project_path.exists():
-            durable_time = self.project_path.stat().st_mtime_ns
-            recovery_time = self.recovery_path.stat().st_mtime_ns
-            if recovery_time <= durable_time:
-                fresh_time = durable_time + 1_000_000_000
-                os.utime(self.recovery_path, ns=(fresh_time, fresh_time))
+        envelope = {
+            "recovery_version": _RECOVERY_VERSION,
+            "base_fingerprint": self._base_fingerprint,
+            "project": self.project.to_dict(),
+        }
+        publish_text_batch(
+            {self.recovery_path: json.dumps(envelope, ensure_ascii=False, indent=2)},
+            {self.recovery_path: self.recovery_path.with_suffix(self.recovery_path.suffix + ".tmp")},
+        )
+
+    def recovery_project(self) -> Project:
+        project, _ = self._read_recovery()
+        return project
 
     def discard_recovery(self) -> None:
         self.recovery_path.unlink(missing_ok=True)
@@ -119,16 +129,11 @@ class EditorSession:
             primary.recovery_error = recovery_error
             primary.add_note(f"Recovery could not be written: {recovery_error}")
 
-    def _remove_committed_recovery(self, recovery_path: Path, durable_path: Path) -> None:
+    def _remove_committed_recovery(self, recovery_path: Path) -> None:
         try:
             recovery_path.unlink(missing_ok=True)
         except OSError as exc:
             self.last_warning = f"Save committed, but the old recovery snapshot could not be removed: {exc}"
-            try:
-                durable_time = durable_path.stat().st_mtime_ns
-                os.utime(recovery_path, ns=(durable_time, durable_time))
-            except OSError:
-                pass
 
     @classmethod
     def open(
@@ -143,21 +148,32 @@ class EditorSession:
         session = cls(durable, project_path, track_index, export_paths)
         if not session.recovery_path.exists():
             return session
-        if session.recovery_path.stat().st_mtime_ns <= project_path.stat().st_mtime_ns:
+        recovered, base_fingerprint = session._read_recovery()
+        if base_fingerprint != session._base_fingerprint:
             try:
                 session.discard_recovery()
-            except OSError:
-                pass
+            except OSError as exc:
+                session.last_warning = f"The stale recovery snapshot could not be removed: {exc}"
             return session
         decision = recovery_decision(session.recovery_path)
         if decision == "recover":
-            session.project = ProjectStore(session.recovery_path).load()
+            session.project = recovered
             session.dirty = True
         elif decision == "discard":
             session.discard_recovery()
         else:
             raise ValueError("Recovery decision must be 'recover' or 'discard'")
         return session
+
+    def _read_recovery(self) -> tuple[Project, str | None]:
+        data = json.loads(self.recovery_path.read_text(encoding="utf-8"))
+        if data.get("recovery_version") == _RECOVERY_VERSION and "project" in data:
+            return Project.from_dict(data["project"]), data.get("base_fingerprint")
+        return Project.from_dict(data), None
+
+    @staticmethod
+    def _fingerprint(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
 
     def _paths_for_track(self, paths: Iterable[Path]) -> dict[str, Path]:
         selected = {}

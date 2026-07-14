@@ -90,3 +90,24 @@ def test_cleanup_failure_does_not_mask_primary_staging_failure(tmp_path, monkeyp
 
     with pytest.raises(OSError, match="primary staging failure"):
         publish_text_batch({destination: "new"})
+
+
+def test_no_replace_rollback_reports_partial_destination_that_cannot_be_removed(tmp_path, monkeypatch):
+    project = tmp_path / "renamed.qcp"
+    export = tmp_path / "renamed.en.srt"
+    export.write_text("collision", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def deny_project_rollback(path, *args, **kwargs):
+        if path == project:
+            raise PermissionError("project is locked")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_project_rollback)
+
+    with pytest.raises(FileExistsError) as caught:
+        publish_text_batch({project: "project", export: "subtitle"}, replace_existing=False)
+
+    assert project.exists()
+    assert [failure.path for failure in caught.value.rollback_failures] == [project]
+    assert "project is locked" in str(caught.value.rollback_failures[0].error)

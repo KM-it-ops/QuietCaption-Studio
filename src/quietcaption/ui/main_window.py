@@ -221,19 +221,39 @@ class MainWindow(QMainWindow):
             if choice == QMessageBox.Cancel:
                 return False
             decisions.append((editor, choice))
-        for editor, choice in decisions:
+        for editor, _ in decisions:
             editor.stop_recovery_timer()
+        try:
+            for editor, _ in decisions:
+                editor.session.write_recovery()
+        except Exception as exc:
+            self._resume_pending_editors(editor for editor, _ in decisions)
+            QMessageBox.critical(self, "Could not protect unsaved edits", str(exc))
+            return False
+        for editor, choice in decisions:
             if choice == QMessageBox.Save and not editor.save():
-                editor.resume_recovery_timer()
+                self._resume_pending_editors(item for item, _ in decisions)
                 return False
+        for editor, choice in decisions:
             if choice == QMessageBox.Discard:
                 try:
                     editor.session.discard_recovery()
-                except OSError as exc:
-                    editor.resume_recovery_timer()
+                except Exception as exc:
+                    self._resume_pending_editors(item for item, _ in decisions)
                     QMessageBox.critical(self, "Could not discard recovery", str(exc))
                     return False
         return True
+
+    @staticmethod
+    def _resume_pending_editors(editors) -> None:
+        for editor in editors:
+            if not editor.is_dirty():
+                continue
+            try:
+                editor.session.write_recovery()
+            except Exception:
+                pass
+            editor.resume_recovery_timer()
 
     def closeEvent(self, event):
         if self.request_close():

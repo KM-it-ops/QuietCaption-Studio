@@ -1,5 +1,7 @@
+from dataclasses import replace
 from pathlib import Path
 
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox
 
@@ -122,7 +124,7 @@ def test_dirty_edit_is_debounced_to_a_recovery_snapshot(qtbot, tmp_path):
     editor.table.item(0, 2).setText("autosaved edit")
 
     qtbot.waitUntil(session.recovery_path.exists, timeout=2000)
-    recovered = ProjectStore(session.recovery_path).load()
+    recovered = session.recovery_project()
     assert recovered.tracks[0].segments[0].text == "autosaved edit"
 
 
@@ -205,6 +207,31 @@ def test_multi_editor_cancel_is_two_phase_and_preserves_all_state(qtbot, tmp_pat
     window.close()
 
 
+def test_discard_waits_for_later_save_and_is_preserved_when_save_fails(qtbot, tmp_path, monkeypatch):
+    discard_session = session_at(tmp_path / "discard")
+    save_session = session_at(tmp_path / "save")
+    discard_editor = SubtitleEditor(discard_session)
+    save_editor = SubtitleEditor(save_session, error_handler=lambda *_: None)
+    window = MainWindow(demo=True)
+    qtbot.addWidget(window)
+    discard_editor.table.item(0, 2).setText("keep if close fails")
+    save_editor.table.item(0, 2).setText("save fails")
+    discard_session.write_recovery()
+    save_session.write_recovery()
+    window._editors = [discard_editor, save_editor]
+    choices = iter((QMessageBox.Discard, QMessageBox.Save))
+    window._close_choice = lambda _: next(choices)
+    monkeypatch.setattr(save_session, "save", lambda: (_ for _ in ()).throw(OSError("read only")))
+
+    assert not window.request_close()
+    window._close_choice = lambda _: QMessageBox.Discard
+
+    assert discard_session.recovery_path.exists()
+    assert discard_session.recovery_project().tracks[0].segments[0].text == "keep if close fails"
+    assert discard_editor._recovery_timer.isActive()
+    window.close()
+
+
 def test_close_event_accepts_clean_and_ignores_cancelled_dirty_close(qtbot, tmp_path):
     class Event:
         def __init__(self):
@@ -253,3 +280,29 @@ def test_save_error_reports_when_recovery_could_not_be_written(qtbot, tmp_path, 
     assert "publish failed" in errors[0][1]
     assert "Recovery could not be written" in errors[0][1]
     assert "recovery failed" in errors[0][1]
+
+
+def test_editor_surfaces_stale_recovery_cleanup_warning_on_open(qtbot, tmp_path, monkeypatch):
+    session = session_at(tmp_path)
+    session.set_segment_text(0, "stale")
+    session.write_recovery()
+    durable = ProjectStore(session.project_path).load()
+    newer_track = replace(durable.tracks[0], segments=[replace(durable.tracks[0].segments[0], text="durable")])
+    ProjectStore(session.project_path).save(replace(durable, tracks=[newer_track]))
+    recovery_path = session.recovery_path
+    real_unlink = Path.unlink
+
+    def deny_cleanup(path, *args, **kwargs):
+        if path == recovery_path:
+            raise PermissionError("locked stale recovery")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_cleanup)
+    opened = EditorSession.open(session.project_path, 0, list(session.export_paths.values()), lambda _: pytest.fail("must not prompt"))
+    warnings = []
+
+    editor = SubtitleEditor(opened, warning_handler=lambda title, message: warnings.append((title, message)))
+    qtbot.addWidget(editor)
+
+    assert warnings and warnings[0][0] == "Recovery warning"
+    assert "locked stale recovery" in warnings[0][1]
