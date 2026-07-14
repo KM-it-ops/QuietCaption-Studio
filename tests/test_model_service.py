@@ -958,3 +958,222 @@ def test_runtime_manifest_rejects_symlink_escape(tmp_path):
     assert not service.verify(descriptor)
     with pytest.raises(ValueError, match="manifest"):
         service.acquire_runtime(("transcription",))
+
+
+def _move_verification_service(tmp_path):
+    transcription = ModelDescriptor(
+        "transcriber", "transcription", {"en"}, 1, "owner/transcriber", "0" * 64, revision="tx-rev"
+    )
+    translation = ModelDescriptor(
+        "translator", "translation", {"en"}, 1, "owner/translator", "0" * 64, revision="tl-rev"
+    )
+    spare = ModelDescriptor(
+        "spare", "transcription", {"en"}, 1, "owner/spare", "0" * 64, revision="spare-rev"
+    )
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(f"{repo_id}@{revision}".encode())
+
+    source = tmp_path / "models"
+    service = ModelService(ModelRegistry(source, [transcription, translation, spare]), fetcher=fetch)
+    for descriptor in (transcription, translation):
+        service.install(descriptor)
+        service.activate(descriptor)
+    return service, (transcription, translation), spare
+
+
+def _assert_staged_move_rejected_without_mutation(tmp_path, monkeypatch, mutate_staging):
+    service, installed, spare = _move_verification_service(tmp_path)
+    source = service.registry.root
+    destination = tmp_path / "moved-models"
+    destination.mkdir()
+    before_source = _tree_snapshot(source)
+    before_destination = _tree_snapshot(destination)
+    import quietcaption.model_service as module
+
+    real_copytree = module.shutil.copytree
+
+    def copytree_then_mutate(copy_source, staging, *args, **kwargs):
+        result = real_copytree(copy_source, staging, *args, **kwargs)
+        if Path(copy_source) == source:
+            mutate_staging(Path(staging), installed, spare)
+        return result
+
+    monkeypatch.setattr(module.shutil, "copytree", copytree_then_mutate)
+
+    with pytest.raises(ValueError, match="integrity"):
+        service.move(destination)
+
+    assert service.registry.root == source
+    assert _tree_snapshot(source) == before_source
+    assert _tree_snapshot(destination) == before_destination
+    assert not tuple(tmp_path.glob(".moved-models.moving.*"))
+
+
+def test_move_rejects_corrupted_staged_bytes(tmp_path, monkeypatch):
+    def corrupt_model_bytes(staging, installed, spare):
+        staging.joinpath(installed[0].id, "model.bin").write_bytes(b"corrupted after copy")
+
+    _assert_staged_move_rejected_without_mutation(tmp_path, monkeypatch, corrupt_model_bytes)
+
+
+@pytest.mark.parametrize(
+    "invalidity",
+    [
+        "manifest_not_object",
+        "id_mismatch",
+        "kind_mismatch",
+        "revision_mismatch",
+        "repo_id_mismatch",
+        "marker_revision_mismatch",
+        "missing_listed_file",
+        "wrong_hash",
+        "invalid_hash_format",
+        "absolute_path",
+        "parent_traversal",
+        "empty_files",
+        "non_dict_files",
+        "unlisted_payload",
+    ],
+)
+def test_move_rejects_invalid_staged_manifest(tmp_path, monkeypatch, invalidity):
+    def invalidate_manifest(staging, installed, spare):
+        descriptor = installed[0]
+        model_root = staging / descriptor.id
+        manifest = model_root / "manifest.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        if invalidity == "manifest_not_object":
+            manifest.write_text("[]", encoding="utf-8")
+            return
+        if invalidity.endswith("_mismatch"):
+            field = invalidity.removesuffix("_mismatch")
+            if field == "marker_revision":
+                model_root.joinpath(".complete").write_text("unexpected", encoding="ascii")
+            else:
+                payload[field] = "unexpected"
+        elif invalidity == "missing_listed_file":
+            model_root.joinpath("model.bin").unlink()
+        elif invalidity == "wrong_hash":
+            payload["files"]["model.bin"] = "f" * 64
+        elif invalidity == "invalid_hash_format":
+            payload["files"]["model.bin"] = "not-a-sha256"
+        elif invalidity == "absolute_path":
+            outside = tmp_path / "outside-listed.bin"
+            outside.write_bytes(b"outside")
+            payload["files"] = {str(outside): hashlib.sha256(b"outside").hexdigest()}
+        elif invalidity == "parent_traversal":
+            staging.joinpath("escape.bin").write_bytes(b"outside model")
+            payload["files"] = {"../escape.bin": hashlib.sha256(b"outside model").hexdigest()}
+        elif invalidity == "empty_files":
+            payload["files"] = {}
+        elif invalidity == "non_dict_files":
+            payload["files"] = []
+        elif invalidity == "unlisted_payload":
+            model_root.joinpath("unexpected.bin").write_bytes(b"unlisted")
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    _assert_staged_move_rejected_without_mutation(tmp_path, monkeypatch, invalidate_manifest)
+
+
+def test_move_rejects_invalid_staged_manifest_symlink_escape(tmp_path, monkeypatch):
+    outside = tmp_path / "outside-symlink.bin"
+    outside.write_bytes(b"outside")
+    probe = tmp_path / "symlink-probe.bin"
+    try:
+        probe.symlink_to(outside)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink creation requires SeCreateSymbolicLinkPrivilege")
+        raise
+    probe.unlink()
+
+    def add_escaping_symlink(staging, installed, spare):
+        model_root = staging / installed[0].id
+        link = model_root / "link.bin"
+        link.symlink_to(outside)
+        manifest = model_root / "manifest.json"
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["files"] = {"link.bin": hashlib.sha256(b"outside").hexdigest()}
+        manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    _assert_staged_move_rejected_without_mutation(tmp_path, monkeypatch, add_escaping_symlink)
+
+
+@pytest.mark.parametrize(
+    "invalidity",
+    ["malformed_json", "unknown_id", "role_mismatch", "not_installed", "invalid_install", "non_string_id", "extra_field"],
+)
+def test_move_rejects_invalid_staged_active_pointer(tmp_path, monkeypatch, invalidity):
+    def invalidate_pointer(staging, installed, spare):
+        pointer = staging / "active-transcription.json"
+        if invalidity == "malformed_json":
+            pointer.write_text("not-json", encoding="utf-8")
+        elif invalidity == "unknown_id":
+            pointer.write_text('{"id":"unknown"}', encoding="utf-8")
+        elif invalidity == "role_mismatch":
+            pointer.write_text(f'{{"id":"{installed[1].id}"}}', encoding="utf-8")
+        elif invalidity == "not_installed":
+            pointer.write_text(f'{{"id":"{spare.id}"}}', encoding="utf-8")
+        elif invalidity == "invalid_install":
+            staging.joinpath(installed[0].id, "model.bin").write_bytes(b"invalid active bytes")
+        elif invalidity == "non_string_id":
+            pointer.write_text('{"id":1}', encoding="utf-8")
+        elif invalidity == "extra_field":
+            pointer.write_text(f'{{"id":"{installed[0].id}","extra":true}}', encoding="utf-8")
+
+    _assert_staged_move_rejected_without_mutation(tmp_path, monkeypatch, invalidate_pointer)
+
+
+def test_verify_rejects_model_root_outside_explicit_registry_root(tmp_path):
+    registry_root = tmp_path / "models"
+    registry_root.mkdir()
+    descriptor = ModelDescriptor(
+        "../outside-model", "transcription", {"en"}, 1, "owner/outside", "0" * 64, revision="outside-rev"
+    )
+    model_root = tmp_path / "outside-model"
+    model_root.mkdir()
+    model_root.joinpath("model.bin").write_bytes(b"outside")
+    model_root.joinpath(".complete").write_text(descriptor.revision, encoding="ascii")
+    model_root.joinpath("manifest.json").write_text(
+        json.dumps(
+            {
+                "id": descriptor.id,
+                "kind": descriptor.kind,
+                "revision": descriptor.revision,
+                "repo_id": descriptor.url,
+                "files": {"model.bin": hashlib.sha256(b"outside").hexdigest()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = ModelService(ModelRegistry(registry_root, [descriptor]), fetcher=lambda *_: None)
+
+    assert not service.verify(descriptor)
+
+
+def test_move_staged_verification_does_not_reread_mutable_registry_root(tmp_path, monkeypatch):
+    service, installed, spare = _move_verification_service(tmp_path)
+    destination = tmp_path / "moved-models"
+    import quietcaption.model_service as module
+
+    real_copytree = module.shutil.copytree
+    copied = False
+    real_is_installed = service.registry.is_installed
+
+    def track_copytree(source, staging, *args, **kwargs):
+        nonlocal copied
+        result = real_copytree(source, staging, *args, **kwargs)
+        copied = True
+        return result
+
+    def reject_mutable_root_read(model_id):
+        if copied:
+            raise AssertionError("staged verification reread mutable registry.root")
+        return real_is_installed(model_id)
+
+    monkeypatch.setattr(module.shutil, "copytree", track_copytree)
+    monkeypatch.setattr(service.registry, "is_installed", reject_mutable_root_read)
+
+    assert service.move(destination) == destination
+    assert service.registry.root == destination

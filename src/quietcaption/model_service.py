@@ -249,16 +249,7 @@ class ModelService:
                         raise ValueError(f"Active {kind} model installation marker is invalid") from exc
                     if not path.is_dir() or not marker.is_file() or marker_revision != descriptor.revision:
                         raise ValueError(f"Active {kind} model installation marker is invalid")
-                    manifest = path / "manifest.json"
-                    if not manifest.is_file():
-                        raise ValueError(f"Active {kind} model manifest is missing")
-                    try:
-                        payload = json.loads(manifest.read_text(encoding="utf-8"))
-                    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                        raise ValueError(f"Active {kind} model manifest is invalid") from exc
-                    identity = (payload.get("id"), payload.get("kind"), payload.get("revision"), payload.get("repo_id"))
-                    expected_identity = (descriptor.id, descriptor.kind, descriptor.revision, descriptor.url)
-                    if identity != expected_identity or not self._verify_at_root(descriptor, root):
+                    if not self._verify_at_root(descriptor, root):
                         raise ValueError(f"Active {kind} model manifest is invalid")
                     runtimes.append(ModelRuntime(descriptor, path))
                 result = tuple(runtimes)
@@ -337,15 +328,28 @@ class ModelService:
         passed verification, so an interrupted or invalid move is recoverable.
         """
         with self.mutation("move"):
-            installed_ids = tuple(
-                item.id for item in self.registry.catalog
-                if self.registry.is_installed(item.id)
+            source_root = self.registry.root.resolve()
+            installed = tuple(
+                item for item in self.registry.catalog
+                if self._is_installed_at_root(item.id, source_root)
             )
-            self._assert_not_in_use(*installed_ids)
-            return self._move_unlocked(Path(destination), verifier)
+            self._assert_not_in_use(*(item.id for item in installed))
+            return self._move_unlocked(
+                Path(destination),
+                verifier,
+                source_root=source_root,
+                installed=installed,
+            )
 
-    def _move_unlocked(self, destination: Path, verifier=None) -> Path:
-        source = self.registry.root
+    def _move_unlocked(
+        self,
+        destination: Path,
+        verifier=None,
+        *,
+        source_root: Path,
+        installed: tuple[ModelDescriptor, ...],
+    ) -> Path:
+        source = Path(source_root)
         if source.resolve() == destination.resolve():
             return destination
         if destination.exists() and any(destination.iterdir()):
@@ -356,7 +360,7 @@ class ModelService:
         destination_was_empty = destination.exists()
         try:
             shutil.copytree(source, staging)
-            verify_copy = verifier or self._verify_registry_copy
+            verify_copy = verifier or (lambda root: self._verify_registry_copy(root, installed))
             if not verify_copy(staging):
                 raise ValueError("Moved model copy failed integrity verification")
             if destination.exists():
@@ -375,13 +379,29 @@ class ModelService:
             self._record_cleanup_warning("move", source, exc)
         return destination
 
-    def _verify_registry_copy(self, root: Path) -> bool:
-        installed = [item for item in self.registry.catalog if self.registry.is_installed(item.id)]
-        return all(
-            root.joinpath(item.id, ".complete").exists()
-            and root.joinpath(item.id, "manifest.json").exists()
-            for item in installed
-        )
+    def _verify_registry_copy(self, root: Path, installed: tuple[ModelDescriptor, ...]) -> bool:
+        staged_root = Path(root)
+        if not all(self._verify_at_root(item, staged_root) for item in installed):
+            return False
+        try:
+            resolved_root = staged_root.resolve(strict=True)
+            for pointer in staged_root.glob("active-*.json"):
+                resolved_pointer = pointer.resolve(strict=True)
+                if not resolved_pointer.is_relative_to(resolved_root) or not resolved_pointer.is_file():
+                    return False
+                payload = json.loads(pointer.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict) or set(payload) != {"id"} or not isinstance(payload["id"], str):
+                    return False
+                kind = pointer.name.removeprefix("active-").removesuffix(".json")
+                descriptor = next(
+                    (item for item in installed if item.id == payload["id"] and item.kind == kind),
+                    None,
+                )
+                if descriptor is None or not self._verify_at_root(descriptor, staged_root):
+                    return False
+        except (OSError, ValueError, TypeError, RuntimeError, json.JSONDecodeError):
+            return False
+        return True
 
     def activate(self, descriptor: ModelDescriptor) -> ModelDescriptor:
         with self.mutation("activate"):
@@ -428,25 +448,59 @@ class ModelService:
         return Path(root).joinpath(model_id, ".complete").exists()
 
     def _verify_at_root(self, descriptor: ModelDescriptor, registry_root: Path) -> bool:
-        model_root = Path(registry_root) / descriptor.id
-        manifest = model_root / "manifest.json"
-        if not self._is_installed_at_root(descriptor.id, registry_root) or not manifest.exists():
-            return False
         try:
+            resolved_registry_root = Path(registry_root).resolve(strict=True)
+            model_root = Path(registry_root) / descriptor.id
             resolved_root = model_root.resolve(strict=True)
-            payload = json.loads(manifest.read_text(encoding="utf-8"))
-            if payload.get("revision") != descriptor.revision:
+            if resolved_root == resolved_registry_root or not resolved_root.is_relative_to(resolved_registry_root):
                 return False
-            expected_files = payload.get("files", {})
+            marker = resolved_root / ".complete"
+            manifest = resolved_root / "manifest.json"
+            resolved_marker = marker.resolve(strict=True)
+            resolved_manifest = manifest.resolve(strict=True)
+            if (
+                not resolved_marker.is_relative_to(resolved_root)
+                or not resolved_manifest.is_relative_to(resolved_root)
+                or not resolved_marker.is_file()
+                or not resolved_manifest.is_file()
+                or marker.read_text(encoding="ascii") != descriptor.revision
+            ):
+                return False
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return False
+            identity = (payload.get("id"), payload.get("kind"), payload.get("revision"), payload.get("repo_id"))
+            expected_identity = (descriptor.id, descriptor.kind, descriptor.revision, descriptor.url)
+            if identity != expected_identity:
+                return False
+            expected_files = payload.get("files")
             if not isinstance(expected_files, dict) or not expected_files:
                 return False
+            listed_paths: set[Path] = set()
             for relative, expected in expected_files.items():
-                if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+                if (
+                    not isinstance(relative, str)
+                    or not relative
+                    or Path(relative).is_absolute()
+                    or not isinstance(expected, str)
+                    or len(expected) != 64
+                    or any(character not in "0123456789abcdefABCDEF" for character in expected)
+                ):
                     return False
-                candidate = resolved_root.joinpath(relative).resolve(strict=True)
+                candidate_path = Path(os.path.abspath(resolved_root / relative))
+                if not candidate_path.is_relative_to(resolved_root) or candidate_path in listed_paths:
+                    return False
+                candidate = candidate_path.resolve(strict=True)
                 if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
                     return False
-                if _sha256(candidate) != expected:
+                if _sha256(candidate) != expected.lower():
+                    return False
+                listed_paths.add(candidate_path)
+            control_paths = {manifest, marker}
+            for candidate_path in resolved_root.rglob("*"):
+                if not candidate_path.is_file() or candidate_path in control_paths:
+                    continue
+                if Path(os.path.abspath(candidate_path)) not in listed_paths:
                     return False
             return True
         except (OSError, ValueError, TypeError, RuntimeError, json.JSONDecodeError):
