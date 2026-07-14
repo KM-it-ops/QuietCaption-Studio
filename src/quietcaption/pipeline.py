@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-import json
 import os
 import shutil
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -13,10 +11,11 @@ from uuid import uuid4
 from .atomic_files import publish_text_batch
 from .domain import Project, SubtitleSegment, SubtitleTrack
 from .formats import SrtWriter, TextWriter, VttWriter
+from .filesystem_lock import DEFAULT_STALE_AFTER_SECONDS, FilesystemLock
 from .projects import project_json
 
 
-_MALFORMED_LOCK_LEASE_SECONDS = 30.0
+_MALFORMED_LOCK_LEASE_SECONDS = DEFAULT_STALE_AFTER_SECONDS
 
 
 @dataclass(frozen=True)
@@ -44,107 +43,12 @@ class CollisionError(RuntimeError):
         super().__init__(f"Output namespace already exists: {paths}")
 
 
-class _NamespaceReservation:
-    _active_tokens: set[str] = set()
-
+class _NamespaceReservation(FilesystemLock):
     def __init__(self, output_directory: Path, base_name: str):
         normalized_name = os.path.normcase(base_name)
         digest = hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()
-        self.path = output_directory / f".quietcaption-reservation-{digest}.lock"
-        self.acquired = False
-        self.token = uuid4().hex
-
-    def acquire(self) -> bool:
-        for attempt in range(2):
-            try:
-                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                if attempt == 0 and self._recover_orphaned_lock():
-                    continue
-                return False
-            primary = None
-            try:
-                payload = json.dumps({"pid": os.getpid(), "token": self.token}).encode("utf-8")
-                os.write(descriptor, payload)
-            except Exception as exc:
-                primary = exc
-            try:
-                os.close(descriptor)
-            except Exception as close_error:
-                if primary is None:
-                    primary = close_error
-                else:
-                    primary.close_error = close_error
-                    primary.add_note(f"Reservation descriptor close also failed: {close_error}")
-            if primary is not None:
-                cleanup_error = self._unlink_with_retries()
-                if cleanup_error is not None:
-                    primary.cleanup_error = cleanup_error
-                    primary.add_note(f"Partial reservation cleanup failed: {cleanup_error}")
-                raise primary
-            self.acquired = True
-            self._active_tokens.add(self.token)
-            return True
-        return False
-
-    def release(self) -> str | None:
-        if self.acquired:
-            error = self._unlink_with_retries()
-            self._active_tokens.discard(self.token)
-            self.acquired = False
-            if error is not None:
-                return f"Output reservation cleanup failed at {self.path}: {error}"
-        return None
-
-    def _recover_orphaned_lock(self) -> bool:
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-            token = payload.get("token")
-            pid = int(payload.get("pid"))
-        except (ValueError, TypeError, json.JSONDecodeError):
-            return self._recover_aged_malformed_lock()
-        except OSError:
-            return False
-        if token in self._active_tokens:
-            return False
-        if pid != os.getpid() and self._pid_running(pid):
-            return False
-        return self._unlink_with_retries() is None
-
-    def _recover_aged_malformed_lock(self) -> bool:
-        try:
-            observed = self.path.stat()
-        except OSError:
-            return False
-        if time.time() - observed.st_mtime < _MALFORMED_LOCK_LEASE_SECONDS:
-            return False
-        try:
-            current = self.path.stat()
-        except OSError:
-            return False
-        identity = (observed.st_ino, observed.st_size, observed.st_mtime_ns)
-        if identity != (current.st_ino, current.st_size, current.st_mtime_ns):
-            return False
-        return self._unlink_with_retries() is None
-
-    def _unlink_with_retries(self) -> OSError | None:
-        for attempt in range(3):
-            try:
-                self.path.unlink(missing_ok=True)
-                return None
-            except OSError as exc:
-                if attempt == 2:
-                    return exc
-                time.sleep(0.01)
-        return None
-
-    @staticmethod
-    def _pid_running(pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        return True
+        path = output_directory / f".quietcaption-reservation-{digest}.lock"
+        super().__init__(path, description="Output reservation")
 
 
 @dataclass(frozen=True)
@@ -231,15 +135,15 @@ class SubtitlePipeline:
         cleanup_warning = selection.reservation.release()
         if primary is not None:
             if cleanup_warning:
-                primary.cleanup_warning = OSError(cleanup_warning)
-                primary.add_note(cleanup_warning)
+                primary.cleanup_warning = OSError(str(cleanup_warning))
+                primary.add_note(str(cleanup_warning))
             raise primary
         if cleanup_warning:
             result = PipelineResult(
                 result.project_path,
                 result.exports,
                 result.skipped,
-                (*result.warnings, cleanup_warning),
+                (*result.warnings, str(cleanup_warning)),
             )
         return result
 

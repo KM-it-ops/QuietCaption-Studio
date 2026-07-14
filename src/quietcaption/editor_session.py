@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import time
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -12,6 +10,7 @@ from typing import Callable, Iterable
 from .atomic_files import publish_text_batch
 from .domain import Project, SubtitleTrack
 from .formats import SrtWriter, TextWriter, VttWriter
+from .filesystem_lock import FilesystemLock
 from .projects import ProjectStore, project_json
 
 
@@ -24,37 +23,6 @@ class SaveConflictError(RuntimeError):
     def __init__(self, project_path: Path):
         self.project_path = Path(project_path)
         super().__init__(f"Project changed outside QuietCaption: {self.project_path}")
-
-
-class _ProjectSaveLock:
-    def __init__(self, project_path: Path, timeout: float = 5.0):
-        self.path = project_path.with_name(f".{project_path.name}.save.lock")
-        self.timeout = timeout
-        self.acquired = False
-
-    def __enter__(self):
-        deadline = time.monotonic() + self.timeout
-        while True:
-            try:
-                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise SaveConflictError(self.path)
-                time.sleep(0.01)
-                continue
-            try:
-                os.write(descriptor, str(os.getpid()).encode("ascii"))
-            finally:
-                os.close(descriptor)
-            self.acquired = True
-            return self
-
-    def __exit__(self, *_):
-        if self.acquired:
-            try:
-                self.path.unlink(missing_ok=True)
-            finally:
-                self.acquired = False
 
 
 class EditorSession:
@@ -95,22 +63,38 @@ class EditorSession:
     def save(self) -> None:
         self.last_warning = None
         recovery_path = self.recovery_path
+        lock_path = self.project_path.with_name(f".{self.project_path.name}.save.lock")
+        lock = FilesystemLock(lock_path, description="Project lock")
+        primary = None
         try:
-            with _ProjectSaveLock(self.project_path):
-                export_paths, retained = self._publish_to(
-                    self.project_path,
-                    self.export_paths,
-                    replace_existing=True,
-                    expected_fingerprint=self._base_fingerprint,
-                )
-                self.export_paths = export_paths
-                self.dirty = False
-                self._base_fingerprint = self._fingerprint(self.project_path)
-                self._warn_retained_backups(retained)
-                self._remove_committed_recovery(recovery_path)
+            if not lock.acquire(timeout=5.0):
+                raise SaveConflictError(self.project_path)
+            export_paths, retained = self._publish_to(
+                self.project_path,
+                self.export_paths,
+                replace_existing=True,
+                expected_fingerprint=self._base_fingerprint,
+            )
+            self.export_paths = export_paths
+            self.dirty = False
+            self._base_fingerprint = self._fingerprint(self.project_path)
+            self._warn_retained_backups(retained)
+            self._remove_committed_recovery(recovery_path)
         except Exception as exc:
-            self._recover_after_failure(exc)
-            raise
+            primary = exc
+        cleanup_warning = lock.release()
+        if primary is not None:
+            if cleanup_warning is not None:
+                primary.cleanup_warning = OSError(str(cleanup_warning))
+                primary.add_note(str(cleanup_warning))
+            self._recover_after_failure(primary)
+            raise primary
+        if cleanup_warning is not None:
+            warning = (
+                f"Save committed, but the project lock could not be released at "
+                f"{cleanup_warning.path}: {cleanup_warning.error}"
+            )
+            self.last_warning = f"{self.last_warning} {warning}" if self.last_warning else warning
 
     def save_as(self, destination: Path) -> None:
         destination = Path(destination)

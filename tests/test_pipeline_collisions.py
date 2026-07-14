@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import os
 import time
 
@@ -404,3 +405,17 @@ def test_stale_empty_reservation_is_reclaimed(tmp_path):
     assert reservation.acquire()
     reservation.release()
     assert not reservation.path.exists()
+
+
+def test_reservation_metadata_records_pid_token_and_creation_time(tmp_path):
+    output = tmp_path / "out"
+    output.mkdir()
+    reservation = pipeline_module._NamespaceReservation(output, "clip")
+
+    assert reservation.acquire()
+    metadata = json.loads(reservation.path.read_text(encoding="utf-8"))
+
+    assert metadata["pid"] == os.getpid()
+    assert metadata["token"] == reservation.token
+    assert isinstance(metadata["created_at"], float)
+    reservation.release()

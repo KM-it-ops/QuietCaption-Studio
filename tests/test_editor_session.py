@@ -470,3 +470,103 @@ def test_invalid_recovery_container_shapes_do_not_block_durable_project(tmp_path
     assert opened.track.segments[0].text == "old"
     assert opened.recovery_path.exists()
     assert "corrupt recovery" in opened.last_warning.lower()
+
+
+def test_editor_lock_metadata_write_failure_preserves_primary_and_cleans_lock(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "unsaved")
+    lock_path = session.project_path.with_name(f".{session.project_path.name}.save.lock")
+    primary = OSError("editor lock metadata failed")
+    monkeypatch.setattr(os, "write", lambda *_: (_ for _ in ()).throw(primary))
+
+    with pytest.raises(OSError, match="editor lock metadata failed") as caught:
+        session.save()
+
+    assert caught.value is primary
+    assert not lock_path.exists()
+    assert session.dirty
+    assert session.recovery_project().tracks[0].segments[0].text == "unsaved"
+
+
+def test_editor_lock_close_failure_preserves_primary_and_cleans_lock(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "unsaved")
+    lock_path = session.project_path.with_name(f".{session.project_path.name}.save.lock")
+    real_close = os.close
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        raise OSError("editor lock close failed")
+
+    monkeypatch.setattr(os, "close", close_then_fail)
+
+    with pytest.raises(OSError, match="editor lock close failed"):
+        session.save()
+
+    assert not lock_path.exists()
+    assert session.dirty
+    assert session.recovery_path.exists()
+
+
+def test_editor_save_reclaims_unchanged_stale_malformed_lock(tmp_path):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "saved after stale lock")
+    lock_path = session.project_path.with_name(f".{session.project_path.name}.save.lock")
+    lock_path.write_text("", encoding="utf-8")
+    stale = time.time() - 60
+    os.utime(lock_path, (stale, stale))
+
+    session.save()
+
+    assert not lock_path.exists()
+    assert not session.dirty
+    assert ProjectStore(session.project_path).load().tracks[0].segments[0].text == "saved after stale lock"
+
+
+def test_editor_primary_save_error_survives_lock_release_failure(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "recover me")
+    lock_path = session.project_path.with_name(f".{session.project_path.name}.save.lock")
+    primary = ValueError("render is primary")
+    real_unlink = Path.unlink
+
+    monkeypatch.setattr(session_module.SrtWriter, "render", lambda *_: (_ for _ in ()).throw(primary))
+
+    def deny_lock_release(path, *args, **kwargs):
+        if path == lock_path:
+            raise PermissionError("lock sharing violation")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_lock_release)
+
+    with pytest.raises(ValueError, match="render is primary") as caught:
+        session.save()
+
+    assert caught.value is primary
+    assert str(lock_path) in str(caught.value.cleanup_warning)
+    assert session.dirty
+    assert session.recovery_project().tracks[0].segments[0].text == "recover me"
+
+
+def test_committed_editor_save_reports_unreleased_lock_as_nonfatal_warning(tmp_path, monkeypatch):
+    session = make_session(tmp_path, ("srt",))
+    session.set_segment_text(0, "committed")
+    lock_path = session.project_path.with_name(f".{session.project_path.name}.save.lock")
+    real_unlink = Path.unlink
+
+    def deny_lock_release(path, *args, **kwargs):
+        if path == lock_path:
+            raise PermissionError("lock sharing violation")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", deny_lock_release)
+
+    session.save()
+
+    assert not session.dirty
+    assert ProjectStore(session.project_path).load().tracks[0].segments[0].text == "committed"
+    assert not session.recovery_path.exists()
+    assert lock_path.exists()
+    assert session.last_warning == (
+        f"Save committed, but the project lock could not be released at {lock_path}: lock sharing violation"
+    )
