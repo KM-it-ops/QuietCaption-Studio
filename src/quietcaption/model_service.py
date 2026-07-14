@@ -8,8 +8,9 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 from uuid import uuid4
+from weakref import WeakValueDictionary
 
 from .model_operation_lock import ModelOperationLock
 from .models import ModelDescriptor, ModelRegistry
@@ -28,7 +29,7 @@ class _RegistryUseState:
 
 
 _registry_states_guard = threading.Lock()
-_registry_states: dict[Path, _RegistryUseState] = {}
+_registry_states: WeakValueDictionary[Path, _RegistryUseState] = WeakValueDictionary()
 
 
 def _registry_use_state(registry_root: Path) -> _RegistryUseState:
@@ -83,7 +84,9 @@ def _remove_path(path: Path) -> None:
 class _MutationJournal:
     """Own reversible model swaps and pointer snapshots until commit."""
 
-    def __init__(self) -> None:
+    def __init__(self, operation: str, cleanup_warning: Callable[[str, Path, Exception], None]) -> None:
+        self._operation = operation
+        self._cleanup_warning = cleanup_warning
         self._undo: list[tuple[str, Path, Path | bytes | None]] = []
         self._owned_artifacts: set[Path] = set()
         self._captured_pointers: set[Path] = set()
@@ -115,9 +118,9 @@ class _MutationJournal:
         self._undo.append(("pointer", path, previous))
 
     def commit(self) -> None:
-        self._cleanup_owned_artifacts()
         self._undo.clear()
         self._captured_pointers.clear()
+        self._cleanup_owned_artifacts()
 
     def rollback(self) -> None:
         for action, path, previous in reversed(self._undo):
@@ -142,9 +145,13 @@ class _MutationJournal:
 
     def _cleanup_owned_artifacts(self) -> None:
         for path in tuple(self._owned_artifacts):
-            if path.exists():
-                _remove_path(path)
-            self._owned_artifacts.discard(path)
+            try:
+                if path.exists():
+                    _remove_path(path)
+            except Exception as exc:
+                self._cleanup_warning(self._operation, path, exc)
+            else:
+                self._owned_artifacts.discard(path)
 
 
 def _sha256(path: Path) -> str:
@@ -167,6 +174,37 @@ class ModelService:
     def __init__(self, registry: ModelRegistry, fetcher=None):
         self.registry = registry
         self.fetcher = fetcher or _snapshot_fetcher
+        self._state_root = self.registry.root.resolve()
+        self._use_state = _registry_use_state(self._state_root)
+        self._cleanup_warnings: list[str] = []
+        self._pending_cleanup_paths: set[Path] = set()
+
+    @property
+    def cleanup_warnings(self) -> tuple[str, ...]:
+        return tuple(self._cleanup_warnings)
+
+    @property
+    def pending_cleanup_paths(self) -> tuple[Path, ...]:
+        return tuple(sorted(self._pending_cleanup_paths, key=str))
+
+    def _record_cleanup_warning(self, operation: str, path: Path, exc: Exception) -> None:
+        owned_path = Path(path)
+        self._pending_cleanup_paths.add(owned_path)
+        self._cleanup_warnings.append(
+            f"{operation} left the authoritative model state valid, but cleanup of "
+            f"{owned_path} failed: {exc}. Remove this residual path only after confirming "
+            "that no model lifecycle operation is running."
+        )
+
+    def _state_for_root(self, root: Path) -> _RegistryUseState:
+        normalized_root = Path(root).resolve()
+        if normalized_root != self._state_root:
+            self._state_root = normalized_root
+            self._use_state = _registry_use_state(normalized_root)
+        return self._use_state
+
+    def _journal(self, operation: str) -> _MutationJournal:
+        return _MutationJournal(operation, self._record_cleanup_warning)
 
     @contextmanager
     def mutation(self, operation: str):
@@ -175,7 +213,7 @@ class ModelService:
         operation_lock = ModelOperationLock(root)
         if not operation_lock.acquire():
             raise ModelOperationBusy(root, operation)
-        state = _registry_use_state(root)
+        state = self._state_for_root(root)
         try:
             with state.lock:
                 yield
@@ -184,7 +222,7 @@ class ModelService:
 
     def acquire_runtime(self, kinds: tuple[str, ...]) -> ModelUseLease:
         root = self.registry.root.resolve()
-        state = _registry_use_state(root)
+        state = self._state_for_root(root)
         with state.lock:
             runtimes = []
             for kind in kinds:
@@ -227,7 +265,7 @@ class ModelService:
     def install(self, descriptor: ModelDescriptor) -> Path:
         with self.mutation("install"):
             self._assert_not_in_use(descriptor.id)
-            with _MutationJournal() as journal:
+            with self._journal("install") as journal:
                 return self._install_unlocked(descriptor, journal)
 
     def _install_unlocked(self, descriptor: ModelDescriptor, journal: _MutationJournal) -> Path:
@@ -263,14 +301,14 @@ class ModelService:
         """Install the catalog revision without risking the current installation."""
         with self.mutation("update"):
             self._assert_not_in_use(descriptor.id)
-            with _MutationJournal() as journal:
+            with self._journal("update") as journal:
                 return self._install_unlocked(descriptor, journal)
 
     def repair(self, descriptor: ModelDescriptor) -> Path:
         with self.mutation("repair"):
             self._assert_not_in_use(descriptor.id)
             was_active = self._active_unlocked(descriptor.kind) == descriptor
-            with _MutationJournal() as journal:
+            with self._journal("repair") as journal:
                 installed = self._install_unlocked(descriptor, journal)
                 if was_active:
                     self._activate_unlocked(descriptor, journal)
@@ -281,7 +319,7 @@ class ModelService:
         models = tuple(descriptors)
         with self.mutation("automated setup"):
             self._assert_not_in_use(*(descriptor.id for descriptor in models))
-            with _MutationJournal() as journal:
+            with self._journal("automated setup") as journal:
                 for descriptor in models:
                     self._install_unlocked(descriptor, journal)
                     self._activate_unlocked(descriptor, journal)
@@ -319,15 +357,18 @@ class ModelService:
             if destination.exists():
                 destination.rmdir()
             os.replace(staging, destination)
-            shutil.rmtree(source)
-            self.registry.root = destination
-            return destination
         except Exception:
             if staging.exists():
                 shutil.rmtree(staging)
             if destination_was_empty and not destination.exists():
                 destination.mkdir(parents=True)
             raise
+        self.registry.root = destination
+        try:
+            shutil.rmtree(source)
+        except Exception as exc:
+            self._record_cleanup_warning("move", source, exc)
+        return destination
 
     def _verify_registry_copy(self, root: Path) -> bool:
         installed = [item for item in self.registry.catalog if self.registry.is_installed(item.id)]
@@ -339,7 +380,7 @@ class ModelService:
 
     def activate(self, descriptor: ModelDescriptor) -> ModelDescriptor:
         with self.mutation("activate"):
-            with _MutationJournal() as journal:
+            with self._journal("activate") as journal:
                 return self._activate_unlocked(descriptor, journal)
 
     def _activate_unlocked(self, descriptor: ModelDescriptor, journal: _MutationJournal) -> ModelDescriptor:
@@ -357,7 +398,7 @@ class ModelService:
         return descriptor
 
     def active(self, kind: str) -> ModelDescriptor | None:
-        with _registry_use_state(self.registry.root.resolve()).lock:
+        with self._state_for_root(self.registry.root).lock:
             return self._active_unlocked(kind)
 
     def _active_unlocked(self, kind: str) -> ModelDescriptor | None:
@@ -397,15 +438,25 @@ class ModelService:
             self._remove_unlocked(descriptor, force=force)
 
     def _remove_unlocked(self, descriptor: ModelDescriptor, force: bool = False) -> None:
-        if self._active_unlocked(descriptor.kind) == descriptor and not force:
+        active_model = self._active_unlocked(descriptor.kind)
+        if active_model == descriptor and not force:
             raise ValueError("Cannot remove an active model without force")
         root = self.registry.root / descriptor.id
-        if root.exists(): shutil.rmtree(root)
         active = self.registry.root / f"active-{descriptor.kind}.json"
-        if force and self._active_unlocked(descriptor.kind) == descriptor: active.unlink(missing_ok=True)
+        with self._journal("remove") as journal:
+            if root.exists():
+                removed = self.registry.root / f".{descriptor.id}.removed.{uuid4().hex}"
+                if removed.exists():
+                    raise RuntimeError(f"Unique removal workspace already exists for {descriptor.id}; retry the operation")
+                os.replace(root, removed)
+                journal.claim(removed)
+                journal.record_swap(root, removed)
+            if force and active_model == descriptor:
+                journal.capture_pointer(active)
+                active.unlink(missing_ok=True)
 
     def _assert_not_in_use(self, *model_ids: str) -> None:
-        counts = _registry_use_state(self.registry.root.resolve()).counts
+        counts = self._state_for_root(self.registry.root).counts
         in_use = [model_id for model_id in model_ids if counts.get(model_id, 0)]
         if in_use:
             raise ValueError(f"Model is in use: {', '.join(in_use)}")

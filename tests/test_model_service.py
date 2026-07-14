@@ -1,9 +1,11 @@
+import gc
 import hashlib
 import json
 import multiprocessing
 import os
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -320,6 +322,31 @@ def test_runtime_lease_counts_are_isolated_between_distinct_registry_roots(tmp_p
     assert not service_b.registry.root.joinpath(descriptor.id).exists()
 
 
+def test_normalized_registry_use_state_is_collectible_after_service_release(tmp_path):
+    import quietcaption.model_service as module
+
+    root = (tmp_path / "collectible-models").resolve()
+    service = ModelService(ModelRegistry(root, []), fetcher=lambda *_: None)
+    service.active("transcription")
+    state = module._registry_states[root]
+    state_reference = weakref.ref(state)
+
+    del state
+    del service
+    gc.collect()
+
+    assert state_reference() is None
+    assert root not in module._registry_states
+
+
+def test_model_operation_lock_has_no_stale_recovery_configuration(tmp_path):
+    import quietcaption.model_operation_lock as module
+
+    assert not hasattr(module, "DEFAULT_STALE_AFTER_SECONDS")
+    with pytest.raises(TypeError):
+        ModelOperationLock(tmp_path / "models", stale_after=1)
+
+
 def test_move_rolls_back_when_destination_verification_fails(tmp_path):
     descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
 
@@ -331,6 +358,8 @@ def test_move_rolls_back_when_destination_verification_fails(tmp_path):
     service = ModelService(registry, fetcher=fetch)
     service.install(descriptor)
     destination = tmp_path / "moved-models"
+    source = registry.root
+    before = _tree_snapshot(source)
 
     try:
         service.move(destination, verifier=lambda _: False)
@@ -339,8 +368,163 @@ def test_move_rolls_back_when_destination_verification_fails(tmp_path):
     else:
         raise AssertionError("A failed destination verification must abort the move")
 
+    assert registry.root == source
+    assert _tree_snapshot(source) == before
     assert registry.root.joinpath("demo", ".complete").exists()
     assert not destination.joinpath("demo").exists()
+    assert service.cleanup_warnings == ()
+
+
+@pytest.mark.parametrize("partial_cleanup", [False, True])
+def test_move_source_cleanup_failure_keeps_promoted_destination_authoritative(tmp_path, monkeypatch, partial_cleanup):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"healthy")
+
+    source = tmp_path / "models"
+    destination = tmp_path / "moved-models"
+    service = ModelService(ModelRegistry(source, [descriptor]), fetcher=fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    before_source = _tree_snapshot(source)
+    import quietcaption.model_service as module
+
+    real_rmtree = module.shutil.rmtree
+
+    def fail_source_cleanup(path, *args, **kwargs):
+        if Path(path) == source:
+            if partial_cleanup:
+                source.joinpath(descriptor.id, "model.bin").unlink()
+            raise OSError("old source cleanup denied")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.shutil, "rmtree", fail_source_cleanup)
+
+    assert service.move(destination) == destination
+    assert service.registry.root == destination
+    assert service.verify(descriptor)
+    assert destination.joinpath(descriptor.id, "model.bin").read_bytes() == b"healthy"
+    if partial_cleanup:
+        assert _tree_snapshot(source) != before_source
+    else:
+        assert _tree_snapshot(source) == before_source
+    assert source in service.pending_cleanup_paths
+    assert any("move" in warning and "old source cleanup denied" in warning for warning in service.cleanup_warnings)
+
+
+def test_forced_remove_pointer_failure_restores_model_and_pointer_byte_for_byte(tmp_path, monkeypatch):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"healthy")
+
+    root = tmp_path / "models"
+    service = ModelService(ModelRegistry(root, [descriptor]), fetcher=fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    before = _tree_snapshot(root)
+    pointer = root / "active-transcription.json"
+    real_unlink = Path.unlink
+
+    def fail_pointer_unlink(path, *args, **kwargs):
+        if path == pointer:
+            raise OSError("pointer unlink denied")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_pointer_unlink)
+
+    with pytest.raises(OSError, match="pointer unlink denied"):
+        service.remove(descriptor, force=True)
+
+    assert _tree_snapshot(root) == before
+    assert service.active("transcription") == descriptor
+
+
+def test_forced_remove_cleanup_failure_is_nonfatal_after_logical_commit(tmp_path, monkeypatch):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+
+    def fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"healthy")
+
+    root = tmp_path / "models"
+    service = ModelService(ModelRegistry(root, [descriptor]), fetcher=fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    foreign = root / ".demo.removed"
+    foreign.mkdir()
+    foreign.joinpath("sentinel.bin").write_bytes(b"foreign")
+    import quietcaption.model_service as module
+
+    real_remove_path = module._remove_path
+    injected = []
+
+    def fail_owned_removed_cleanup(path):
+        if path.name.startswith(".demo.removed."):
+            injected.append(path)
+            raise OSError("removed backup cleanup denied")
+        return real_remove_path(path)
+
+    monkeypatch.setattr(module, "_remove_path", fail_owned_removed_cleanup)
+
+    service.remove(descriptor, force=True)
+
+    assert injected
+    assert not root.joinpath(descriptor.id).exists()
+    assert not root.joinpath("active-transcription.json").exists()
+    assert foreign.joinpath("sentinel.bin").read_bytes() == b"foreign"
+    assert injected[0] in service.pending_cleanup_paths
+    assert injected[0].exists()
+    assert any("remove" in warning and "removed backup cleanup denied" in warning for warning in service.cleanup_warnings)
+
+
+@pytest.mark.parametrize("operation", ["update", "repair"])
+def test_committed_install_cleanup_failure_returns_new_valid_state_with_warning(tmp_path, monkeypatch, operation):
+    descriptor = ModelDescriptor("demo", "transcription", {"en"}, 1, "owner/demo", "0" * 64, revision="abc")
+    root = tmp_path / "models"
+
+    def initial_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"original")
+
+    service = ModelService(ModelRegistry(root, [descriptor]), fetcher=initial_fetch)
+    service.install(descriptor)
+    service.activate(descriptor)
+    foreign = root / ".demo.previous"
+    foreign.mkdir()
+    foreign.joinpath("sentinel.bin").write_bytes(b"foreign")
+
+    def replacement_fetch(repo_id, revision, local_dir):
+        local_dir.mkdir(parents=True)
+        local_dir.joinpath("model.bin").write_bytes(b"replacement")
+
+    service.fetcher = replacement_fetch
+    import quietcaption.model_service as module
+
+    real_remove_path = module._remove_path
+    injected = []
+
+    def fail_owned_backup_cleanup(path):
+        if path.name.startswith(".demo.previous."):
+            injected.append(path)
+            raise OSError("install backup cleanup denied")
+        return real_remove_path(path)
+
+    monkeypatch.setattr(module, "_remove_path", fail_owned_backup_cleanup)
+
+    installed = getattr(service, operation)(descriptor)
+
+    assert installed == root / descriptor.id
+    assert installed.joinpath("model.bin").read_bytes() == b"replacement"
+    assert service.active("transcription") == descriptor
+    assert service.verify(descriptor)
+    assert foreign.joinpath("sentinel.bin").read_bytes() == b"foreign"
+    assert injected[0] in service.pending_cleanup_paths
+    assert injected[0].exists()
+    assert any(operation in warning and "install backup cleanup denied" in warning for warning in service.cleanup_warnings)
 
 
 def test_verify_detects_changed_model_files(tmp_path):

@@ -7,19 +7,15 @@ from pathlib import Path
 from typing import BinaryIO
 
 
-DEFAULT_STALE_AFTER_SECONDS = 30.0
-
-
 class ModelOperationLock:
     """Immediate registry lock backed by an OS-owned open file handle."""
 
     _process_guard = threading.Lock()
     _active_paths: set[Path] = set()
 
-    def __init__(self, registry_root: Path, *, stale_after: float = DEFAULT_STALE_AFTER_SECONDS) -> None:
+    def __init__(self, registry_root: Path) -> None:
         self.registry_root = Path(registry_root).resolve()
         self.path = self.registry_root.with_name(f".{self.registry_root.name}.model-operation.lock")
-        self.stale_after = stale_after
         self.acquired = False
         self._handle: BinaryIO | None = None
 
